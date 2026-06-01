@@ -1,0 +1,19 @@
+name: clipnest
+
+services:
+  clipnest:
+    image: ghcr.io/zipenok/clipnest:latest
+    container_name: clipnest
+    restart: unless-stopped
+    ports:
+      - "${CLIPNEST_PORT:-8090}:8080"
+    environment:
+      CLIPNEST_API_TOKEN: ${CLIPNEST_API_TOKEN:-change-me}
+      CLIPNEST_PARSER_ADAPTER: ${CLIPNEST_PARSER_ADAPTER:-native_douyin}
+      CLIPNEST_DOUYIN_COOKIE: ${CLIPNEST_DOUYIN_COOKIE:-}
+      CLIPNEST_DOUYIN_USER_AGENT: ${CLIPNEST_DOUYIN_USER_AGENT:-}
+      CLIPNEST_PUBLIC_BASE_URL: ${CLIPNEST_PUBLIC_BASE_URL:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./data:/data
+      - ${CLIPNEST_DOWNLOAD_DIR_HOST:-./downloads}:/downloads

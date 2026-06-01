@@ -1,0 +1,8 @@
+services:
+  clipnest:
+    build: .
+    image: clipnest:dev
+    volumes:
+      - ./app:/app/app
+      - ./data:/data
+      - ${CLIPNEST_DOWNLOAD_DIR_HOST:-./downloads}:/downloads

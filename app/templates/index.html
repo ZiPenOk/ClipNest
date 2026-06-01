@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260601-06" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <strong>{{ app_name }}</strong>
+          <span>Douyin Library</span>
+        </div>
+        <nav class="nav">
+          <button class="nav-item active" data-view="dashboard" type="button">工作台</button>
+          <button class="nav-item" data-view="library" type="button">媒体库</button>
+          <button class="nav-item" data-view="tasks" type="button">任务</button>
+          <button class="nav-item" data-view="settings" type="button">设置</button>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p id="view-kicker">工作台</p>
+            <h1 id="view-title">{{ app_name }}</h1>
+          </div>
+          <div class="session">
+            <span id="session-status">未登录</span>
+            <button id="logout" class="secondary" title="Logout" type="button">退出</button>
+          </div>
+        </header>
+
+        <section class="login-panel" id="login-panel">
+          <input id="token" type="password" placeholder="API token" value="{{ default_token }}" />
+          <button id="login" title="Login" type="button">登录</button>
+        </section>
+
+        <p class="summary" id="summary">-</p>
+
+        <section class="view active" id="view-dashboard">
+          <section class="submit-panel">
+            <textarea id="urls" placeholder="https://v.douyin.com/..."></textarea>
+            <button id="submit" type="button" title="Add download">添加</button>
+          </section>
+          <section class="author-crawl-panel">
+            <div>
+              <p>作者主页</p>
+              <h2>批量抓取作品</h2>
+            </div>
+            <input id="author-crawl-url" type="url" placeholder="https://www.douyin.com/user/..." />
+            <input id="author-crawl-max" type="number" min="1" max="1000" step="1" value="200" title="最多抓取作品数" />
+            <button id="author-crawl-submit" class="secondary" type="button">抓取并加入队列</button>
+            <div id="author-crawl-result" class="author-crawl-result" hidden></div>
+            <section class="author-crawl-jobs" id="author-crawl-jobs"></section>
+          </section>
+          <section class="stats" id="stats"></section>
+          <section class="section-head">
+            <div>
+              <p>Queue</p>
+              <h2>正在处理</h2>
+            </div>
+            <button class="secondary" data-view-jump="tasks" type="button">查看任务</button>
+          </section>
+          <section class="jobs compact" id="active-jobs"></section>
+        </section>
+
+        <section class="view" id="view-library" hidden>
+          <section class="library-tabs">
+            <button class="library-tab active" data-library-mode="authors" type="button">作者</button>
+            <button class="library-tab" data-library-mode="media" type="button">作品</button>
+          </section>
+          <section class="section-head">
+            <div>
+              <p>Authors</p>
+              <h2 id="library-section-title">作者</h2>
+            </div>
+            <button class="secondary" id="library-refresh" type="button">刷新</button>
+          </section>
+          <section class="library-controls">
+            <input id="library-search" type="search" placeholder="搜索标题、作者或视频 ID" />
+            <select id="library-type-filter" aria-label="Media type">
+              <option value="">全部类型</option>
+              <option value="video">视频</option>
+              <option value="image">图集</option>
+            </select>
+            <select id="library-sort" aria-label="Library sort">
+              <option value="newest">最近下载</option>
+              <option value="oldest">最早下载</option>
+              <option value="size_desc">文件最大</option>
+              <option value="size_asc">文件最小</option>
+              <option value="title">标题 A-Z</option>
+            </select>
+          </section>
+          <section id="library-authors-panel">
+            <section class="author-grid" id="library-authors"></section>
+            <section class="pagination" id="library-authors-pagination"></section>
+          </section>
+          <section id="library-media-panel" hidden>
+            <section class="author-detail" id="library-author-detail" hidden></section>
+            <section class="section-head">
+              <div>
+                <p id="library-filter-label">All Media</p>
+                <h2>作品</h2>
+              </div>
+              <button class="secondary" id="library-clear" type="button">全部作者</button>
+            </section>
+            <section class="media-grid" id="library-media"></section>
+            <section class="pagination" id="library-media-pagination"></section>
+          </section>
+        </section>
+
+        <section class="view" id="view-tasks" hidden>
+          <section class="section-head">
+            <div>
+              <p>Queue</p>
+              <h2>任务列表</h2>
+            </div>
+            <button class="secondary" id="tasks-refresh" type="button">刷新任务</button>
+          </section>
+          <section class="filters">
+            <input id="search" type="search" placeholder="搜索任务" />
+            <select id="status-filter" aria-label="Status">
+              <option value="">全部状态</option>
+              <option value="queued">排队</option>
+              <option value="retry">重试</option>
+              <option value="parsing">解析</option>
+              <option value="downloading">下载</option>
+              <option value="cancelling">取消中</option>
+              <option value="cancelled">已取消</option>
+              <option value="finished">完成</option>
+              <option value="failed">失败</option>
+            </select>
+          </section>
+          <section class="bulk-actions" id="bulk-actions" hidden>
+            <span id="bulk-count">已选择 0 个任务</span>
+            <button class="secondary" id="bulk-retry" type="button">批量重试</button>
+            <button class="secondary" id="bulk-redownload" type="button">批量重下</button>
+            <button class="secondary" id="bulk-cancel" type="button">批量取消</button>
+            <button class="danger" id="bulk-delete" type="button">批量删除</button>
+          </section>
+          <section class="authors" id="authors"></section>
+          <section class="jobs" id="jobs"></section>
+          <section class="pagination" id="tasks-pagination"></section>
+        </section>
+
+        <section class="view" id="view-settings" hidden>
+          <section class="settings-grid">
+            <div class="settings-form">
+              <div class="parser-panel">
+                <div>
+                  <span>解析器</span>
+                  <strong id="parser-info">-</strong>
+                </div>
+                <button id="parser-health" class="secondary" type="button">检查</button>
+              </div>
+              <label class="field-row">
+                <span>解析适配器</span>
+                <select id="setting-parser-adapter">
+                  <option value="native_douyin">native_douyin（推荐）</option>
+                  <option value="native_douyin_share">native_douyin_share</option>
+                </select>
+              </label>
+              <label class="field-row">
+                <span>抖音 Cookie</span>
+                <textarea id="setting-douyin-cookie" rows="4" placeholder="留空表示不修改当前 Cookie"></textarea>
+              </label>
+              <div class="hint" id="setting-douyin-cookie-status">-</div>
+              <label class="field-row">
+                <span>User-Agent</span>
+                <input id="setting-douyin-user-agent" type="text" />
+              </label>
+              <div class="setting-note">
+                <span>A-Bogus 签名</span>
+                <strong>local_abogus</strong>
+                <p>ClipNest 内置本地签名，不调用外部签名服务。</p>
+              </div>
+            </div>
+
+            <div class="settings-form">
+              <label class="check-row">
+                <input id="setting-skip-existing" type="checkbox" />
+                <span>跳过已存在文件</span>
+              </label>
+              <label class="check-row">
+                <input id="setting-queue-paused" type="checkbox" />
+                <span>暂停领取新任务</span>
+              </label>
+              <label class="field-row">
+                <span>同时下载数量</span>
+                <input id="setting-max-concurrent" type="number" min="1" max="6" step="1" />
+              </label>
+              <label class="field-row">
+                <span>失败自动重试次数</span>
+                <input id="setting-auto-retry-attempts" type="number" min="0" max="10" step="1" />
+              </label>
+              <label class="field-row">
+                <span>自动重试间隔（秒）</span>
+                <input id="setting-auto-retry-delay" type="number" min="0" max="86400" step="1" />
+              </label>
+              <label class="check-row">
+                <input id="setting-author-folders" type="checkbox" />
+                <span>按作者建目录</span>
+              </label>
+              <label class="field-row">
+                <span>文件名模板</span>
+                <input id="setting-filename-template" type="text" />
+              </label>
+              <label class="check-row">
+                <input id="setting-telegram-enabled" type="checkbox" />
+                <span>启用 Telegram 下载通知</span>
+              </label>
+              <label class="field-row">
+                <span>Telegram Bot Token</span>
+                <input id="setting-telegram-token" type="password" placeholder="留空表示不修改当前 Token" />
+              </label>
+              <div class="hint" id="setting-telegram-status">-</div>
+              <label class="field-row">
+                <span>Telegram Chat ID</span>
+                <input id="setting-telegram-chat-id" type="text" />
+              </label>
+              <label class="check-row">
+                <input id="setting-telegram-success" type="checkbox" />
+                <span>下载完成时通知</span>
+              </label>
+              <label class="check-row">
+                <input id="setting-telegram-failure" type="checkbox" />
+                <span>下载失败时通知</span>
+              </label>
+              <div class="settings-actions">
+                <button id="settings-save" type="button">保存设置</button>
+                <button id="telegram-test" class="secondary" type="button">发送 TG 测试</button>
+              </div>
+              <div class="hint" id="settings-save-status">-</div>
+            </div>
+
+            <div class="maintenance-panel">
+              <button id="maintenance-health" class="secondary" type="button">健康信息</button>
+              <button id="maintenance-cookie" class="secondary" type="button">Cookie 状态</button>
+              <button id="maintenance-events" class="secondary" type="button">最近事件</button>
+              <button id="maintenance-export" class="secondary" type="button">导出配置</button>
+              <button id="maintenance-backup" class="secondary" type="button">备份数据库</button>
+              <button id="maintenance-cache-assets" class="secondary" type="button">缓存封面头像</button>
+              <button id="maintenance-duplicates" class="secondary" type="button">扫描重复作品</button>
+              <button id="maintenance-clean-duplicates" class="danger" type="button">清理重复记录</button>
+              <button id="maintenance-orphans" class="secondary" type="button">扫描孤儿文件</button>
+              <button id="maintenance-clean-orphans" class="danger" type="button">清理孤儿文件</button>
+              <div id="maintenance-output" hidden></div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div class="scrim" id="drawer-scrim" hidden></div>
+    <section class="quality-dialog" id="quality-dialog" hidden>
+      <header class="quality-head">
+        <div>
+          <p id="quality-platform">解析结果</p>
+          <h2 id="quality-title">选择清晰度</h2>
+        </div>
+        <button id="quality-close" class="secondary" type="button">取消</button>
+      </header>
+      <div class="quality-body">
+        <img id="quality-cover" class="quality-cover" alt="" hidden />
+        <div class="quality-meta">
+          <strong id="quality-author">-</strong>
+          <span id="quality-video-id">-</span>
+        </div>
+        <div class="quality-options" id="quality-options"></div>
+      </div>
+    </section>
+    <section class="media-dialog" id="media-preview-dialog" hidden>
+      <header class="media-preview-head">
+        <div>
+          <p id="media-preview-kicker">作品预览</p>
+          <h2 id="media-preview-title">-</h2>
+        </div>
+        <button id="media-preview-close" class="secondary" type="button">关闭</button>
+      </header>
+      <div id="media-preview-body" class="media-preview-body"></div>
+    </section>
+    <aside class="drawer" id="job-drawer" hidden>
+      <header class="drawer-head">
+        <div>
+          <p id="drawer-kicker">任务详情</p>
+          <h2 id="drawer-title">-</h2>
+        </div>
+        <button id="drawer-close" class="secondary" type="button">关闭</button>
+      </header>
+      <div id="job-detail" class="drawer-body"></div>
+    </aside>
+    <script src="/static/app.js?v=20260601-06"></script>
+  </body>
+</html>
