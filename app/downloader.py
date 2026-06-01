@@ -17,6 +17,9 @@ from .parser import ParserClient, author_name_from_payload
 
 
 ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+DOWNLOAD_PROGRESS_STEP = 5.0
+DOWNLOAD_PROGRESS_INTERVAL = 2.0
+SEGMENTED_DOWNLOAD_ENABLED = False
 
 
 class DownloadCancelled(RuntimeError):
@@ -256,6 +259,11 @@ def parse_content_range_total(value: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def bit_rate_group_index(candidate: dict[str, str]) -> int | None:
+    match = re.match(r"bit_rate_[^_]+_(\d+)_\d+$", str(candidate.get("key") or ""))
+    return int(match.group(1)) if match else None
+
+
 def download_summary(label: str, result: dict[str, Any]) -> str:
     speed_value = float(result.get("speed_bytes_per_second") or 0)
     suffix = " · CDN 较慢" if 0 < speed_value < 128 * 1024 else ""
@@ -318,7 +326,14 @@ async def reorder_candidates_by_probe(
 ) -> list[dict[str, str]]:
     if len(candidates) <= 1:
         return candidates
-    probe_targets = candidates[:max(1, min(limit, len(candidates)))]
+    first_group = bit_rate_group_index(candidates[0])
+    if first_group is not None:
+        probe_targets = [
+            candidate for candidate in candidates
+            if bit_rate_group_index(candidate) == first_group
+        ][:max(1, limit)]
+    else:
+        probe_targets = candidates[:max(1, min(limit, len(candidates)))]
     results = await asyncio.gather(
         *(probe_candidate_speed(candidate, headers) for candidate in probe_targets),
         return_exceptions=True,
@@ -413,7 +428,10 @@ async def stream_to_file(
                         if expected:
                             progress = min(95, 20 + (total / expected) * 75)
                             now = asyncio.get_running_loop().time()
-                            if progress - last_progress >= 1 or now - last_progress_at >= 1:
+                            if (
+                                progress - last_progress >= DOWNLOAD_PROGRESS_STEP
+                                or now - last_progress_at >= DOWNLOAD_PROGRESS_INTERVAL
+                            ):
                                 last_progress = progress
                                 last_progress_at = now
                                 await progress_cb(progress)
@@ -450,15 +468,16 @@ async def segmented_stream_to_file(
     total_size: int,
     cancel_check=None,
 ) -> dict[str, Any]:
-    segment_size = 3 * 1024 * 1024
-    segment_count = max(2, min(6, (total_size + segment_size - 1) // segment_size))
+    segment_size = 512 * 1024 if total_size <= 32 * 1024 * 1024 else 1024 * 1024
     ranges: list[tuple[int, int, str]] = []
-    for index in range(segment_count):
-        start = (total_size * index) // segment_count
-        end = ((total_size * (index + 1)) // segment_count) - 1
+    for index, start in enumerate(range(0, total_size, segment_size)):
+        end = min(total_size - 1, start + segment_size - 1)
         ranges.append((start, end, f"{file_path}.part.{index}"))
+    segment_count = len(ranges)
+    concurrency = min(8, segment_count)
 
     lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(concurrency)
     downloaded = 0
     last_progress = 0.0
     last_progress_at = 0.0
@@ -468,41 +487,48 @@ async def segmented_stream_to_file(
 
     async def download_part(client: httpx.AsyncClient, start: int, end: int, part_path: str) -> int:
         nonlocal downloaded, last_progress, last_progress_at
-        part_headers = build_video_download_headers(headers)
-        part_headers["Range"] = f"bytes={start}-{end}"
-        part_total = 0
-        try:
-            async with client.stream("GET", url, headers=part_headers) as response:
-                response.raise_for_status()
-                if response.status_code != 206:
-                    raise RuntimeError(f"Range segment returned HTTP {response.status_code}")
-                with open(part_path, "wb") as out:
-                    async for chunk in response.aiter_bytes():
-                        if cancel_check and await cancel_check():
-                            raise DownloadCancelled("Download cancelled")
-                        if not chunk:
-                            continue
-                        out.write(chunk)
-                        chunk_size = len(chunk)
-                        part_total += chunk_size
-                        async with lock:
-                            downloaded += chunk_size
-                            progress = min(95, 20 + (downloaded / max(1, total_size)) * 75)
-                            now = asyncio.get_running_loop().time()
-                            if progress - last_progress >= 1 or now - last_progress_at >= 1:
-                                last_progress = progress
-                                last_progress_at = now
-                                await progress_cb(progress)
-        except Exception:
-            if os.path.exists(part_path):
-                os.remove(part_path)
-            raise
-        expected = end - start + 1
-        if part_total != expected:
-            if os.path.exists(part_path):
-                os.remove(part_path)
-            raise RuntimeError(f"Incomplete range segment: got {part_total} bytes, expected {expected}")
-        return part_total
+        async with semaphore:
+            part_headers = build_video_download_headers(headers)
+            part_headers["Range"] = f"bytes={start}-{end}"
+            part_total = 0
+            try:
+                async with client.stream("GET", url, headers=part_headers) as response:
+                    response.raise_for_status()
+                    if response.status_code != 206:
+                        raise RuntimeError(f"Range segment returned HTTP {response.status_code}")
+                    with open(part_path, "wb") as out:
+                        async for chunk in response.aiter_bytes():
+                            if cancel_check and await cancel_check():
+                                raise DownloadCancelled("Download cancelled")
+                            if not chunk:
+                                continue
+                            out.write(chunk)
+                            chunk_size = len(chunk)
+                            part_total += chunk_size
+                            report_progress = None
+                            async with lock:
+                                downloaded += chunk_size
+                                progress = min(95, 20 + (downloaded / max(1, total_size)) * 75)
+                                now = asyncio.get_running_loop().time()
+                                if (
+                                    progress - last_progress >= DOWNLOAD_PROGRESS_STEP
+                                    or now - last_progress_at >= DOWNLOAD_PROGRESS_INTERVAL
+                                ):
+                                    last_progress = progress
+                                    last_progress_at = now
+                                    report_progress = progress
+                            if report_progress is not None:
+                                await progress_cb(report_progress)
+            except Exception:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+                raise
+            expected = end - start + 1
+            if part_total != expected:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+                raise RuntimeError(f"Incomplete range segment: got {part_total} bytes, expected {expected}")
+            return part_total
 
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, limits=limits) as client:
@@ -538,6 +564,8 @@ async def segmented_stream_to_file(
         "http_status": 206,
         "content_range": f"bytes */{total_size}",
         "range_segments": segment_count,
+        "range_concurrency": concurrency,
+        "range_segment_size": segment_size,
     }
 
 
@@ -577,8 +605,12 @@ async def download_with_fallback(
             )
         try:
             video_headers = build_video_download_headers(headers)
-            probe = await probe_range_size(url, video_headers)
-            if probe.get("range_supported") and int(probe.get("total_size") or 0) >= 64 * 1024 * 1024:
+            probe = await probe_range_size(url, video_headers) if SEGMENTED_DOWNLOAD_ENABLED else {}
+            if (
+                SEGMENTED_DOWNLOAD_ENABLED
+                and probe.get("range_supported")
+                and int(probe.get("total_size") or 0) >= 2 * 1024 * 1024
+            ):
                 try:
                     result = await segmented_stream_to_file(
                         url,
@@ -639,6 +671,8 @@ async def download_with_fallback(
                         "content_range": result["content_range"],
                         "range_request": True,
                         "range_segments": result.get("range_segments") or 1,
+                        "range_concurrency": result.get("range_concurrency") or 1,
+                        "range_segment_size": result.get("range_segment_size") or 0,
                     },
                 )
             return {

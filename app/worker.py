@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import threading
 import traceback
 
-from . import db
+from . import db, runtime_state
 from .config import settings
 from .downloader import DownloadCancelled, process_download
 from .notifier import notify_job
@@ -94,9 +94,15 @@ class DownloadWorker:
 
     async def _process(self, job: dict):
         job_id = int(job["id"])
+        runtime_state.clear_job_progress(job_id)
 
         async def update_cb(**fields):
+            if set(fields) == {"progress"}:
+                runtime_state.set_job_progress(job_id, float(fields["progress"]))
+                return
             db.update_job(job_id, **fields)
+            if "progress" in fields:
+                runtime_state.set_job_progress(job_id, float(fields["progress"]))
 
         async def cancel_check() -> bool:
             return self._stop.is_set() or db.is_cancel_requested(job_id)
@@ -159,6 +165,8 @@ class DownloadWorker:
                     next_attempt_at=None,
                 )
                 await notify_job(db.get_job(job_id), "failure")
+        finally:
+            runtime_state.clear_job_progress(job_id)
 
 
 class AuthorCrawlWorker:

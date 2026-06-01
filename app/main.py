@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import db
+from . import db, runtime_state
 from .assets import ASSET_ROOT, author_avatar_url_from_payload, cache_remote_image, cover_url_from_payload
 from .config import settings
 from .downloader import build_download_headers, ordered_bit_rate_candidates, relative_media_path
@@ -714,18 +714,22 @@ async def jobs(
     page_size: int = Query(default=50, ge=1, le=100),
 ):
     if page is not None:
-        return db.list_jobs_page(
-            page=page,
-            page_size=page_size,
+        return runtime_state.overlay_jobs_page(
+            db.list_jobs_page(
+                page=page,
+                page_size=page_size,
+                status=status.strip() if status else None,
+                author=author.strip() if author else None,
+                q=q.strip() if q else None,
+            )
+        )
+    return runtime_state.overlay_jobs(
+        db.list_jobs(
+            limit=limit,
             status=status.strip() if status else None,
             author=author.strip() if author else None,
             q=q.strip() if q else None,
         )
-    return db.list_jobs(
-        limit=limit,
-        status=status.strip() if status else None,
-        author=author.strip() if author else None,
-        q=q.strip() if q else None,
     )
 
 
@@ -833,7 +837,7 @@ async def job(job_id: int):
     found = db.get_job(job_id)
     if not found:
         raise HTTPException(status_code=404, detail="Job not found")
-    return found
+    return runtime_state.overlay_job(found)
 
 
 @app.get("/api/jobs/{job_id}/events", dependencies=[Depends(require_token)])
@@ -989,7 +993,7 @@ async def cancel_job(job_id: int):
     else:
         db.update_job(job_id, status="cancelling", message="Cancelling")
         db.add_event(job_id, "cancel", "Cancellation requested")
-    return db.get_job(job_id) or {}
+    return runtime_state.overlay_job(db.get_job(job_id)) or {}
 
 
 @app.delete("/api/jobs/{job_id}", dependencies=[Depends(require_token)])
