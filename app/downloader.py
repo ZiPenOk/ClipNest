@@ -103,6 +103,17 @@ def build_download_headers(payload: dict[str, Any], parser_settings: dict[str, A
     return headers
 
 
+def build_video_download_headers(headers: dict[str, str]) -> dict[str, str]:
+    video_headers = dict(headers)
+    video_headers.setdefault("Range", "bytes=0-")
+    video_headers.setdefault("Accept-Encoding", "identity")
+    video_headers.setdefault("Connection", "keep-alive")
+    video_headers.setdefault("Sec-Fetch-Dest", "video")
+    video_headers.setdefault("Sec-Fetch-Mode", "no-cors")
+    video_headers.setdefault("Sec-Fetch-Site", "cross-site")
+    return video_headers
+
+
 def candidate_dimension(item: dict[str, Any]) -> tuple[int, int, int]:
     width = int(item.get("width") or 0)
     height = int(item.get("height") or 0)
@@ -277,6 +288,8 @@ async def stream_to_file(
     timeout = httpx.Timeout(None, connect=20.0)
     total = 0
     expected = 0
+    status_code = 0
+    content_range = ""
     last_progress = 0.0
     last_progress_at = 0.0
     started_at = asyncio.get_running_loop().time()
@@ -284,6 +297,8 @@ async def stream_to_file(
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()
+                status_code = response.status_code
+                content_range = str(response.headers.get("content-range") or "")
                 expected = int(response.headers.get("content-length") or 0)
                 with open(temp_path, "wb") as out:
                     async for chunk in response.aiter_bytes():
@@ -319,6 +334,8 @@ async def stream_to_file(
         "expected_size_bytes": expected,
         "duration_seconds": round(duration, 3),
         "speed_bytes_per_second": round(total / duration, 2),
+        "http_status": status_code,
+        "content_range": content_range,
     }
 
 
@@ -356,7 +373,13 @@ async def download_with_fallback(
                 },
             )
         try:
-            result = await stream_to_file(url, file_path, progress_cb, headers=headers, cancel_check=cancel_check)
+            result = await stream_to_file(
+                url,
+                file_path,
+                progress_cb,
+                headers=build_video_download_headers(headers),
+                cancel_check=cancel_check,
+            )
             if job_id is not None:
                 success_message = download_summary(label, result)
                 db.add_event(
@@ -373,6 +396,9 @@ async def download_with_fallback(
                         "expected_size_bytes": result["expected_size_bytes"],
                         "duration_seconds": result["duration_seconds"],
                         "speed_bytes_per_second": result["speed_bytes_per_second"],
+                        "http_status": result["http_status"],
+                        "content_range": result["content_range"],
+                        "range_request": True,
                     },
                 )
             return {
