@@ -209,6 +209,46 @@ def safe_url_host(url: str) -> str:
         return ""
 
 
+def format_size(value: Any) -> str:
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if size <= 0:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024
+        index += 1
+    return f"{size:.1f} {units[index]}" if index else f"{int(size)} {units[index]}"
+
+
+def format_seconds(value: Any) -> str:
+    try:
+        seconds = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if seconds <= 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minute:02d}m{sec:02d}s"
+    return f"{minute}m{sec:02d}s"
+
+
+def download_summary(label: str, result: dict[str, Any]) -> str:
+    speed_value = float(result.get("speed_bytes_per_second") or 0)
+    suffix = " · CDN 较慢" if 0 < speed_value < 128 * 1024 else ""
+    return (
+        f"Downloaded with {label} · {format_size(result.get('bytes'))} "
+        f"in {format_seconds(result.get('duration_seconds'))} · {format_size(speed_value)}/s{suffix}"
+    )
+
+
 def download_candidate_event_data(candidates: list[dict[str, str]], quality_preference: str | None) -> dict[str, Any]:
     return {
         "count": len(candidates),
@@ -231,7 +271,7 @@ async def stream_to_file(
     progress_cb,
     headers: dict[str, str] | None = None,
     cancel_check=None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     temp_path = file_path + ".part"
     headers = headers or {"User-Agent": "Mozilla/5.0 ClipNest/0.1"}
     timeout = httpx.Timeout(None, connect=20.0)
@@ -239,6 +279,7 @@ async def stream_to_file(
     expected = 0
     last_progress = 0.0
     last_progress_at = 0.0
+    started_at = asyncio.get_running_loop().time()
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with client.stream("GET", url, headers=headers) as response:
@@ -271,8 +312,14 @@ async def stream_to_file(
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise RuntimeError(f"Incomplete download: got {total} bytes, expected {expected}")
+    duration = max(0.001, asyncio.get_running_loop().time() - started_at)
     os.replace(temp_path, file_path)
-    return {"bytes": total, "expected_size_bytes": expected}
+    return {
+        "bytes": total,
+        "expected_size_bytes": expected,
+        "duration_seconds": round(duration, 3),
+        "speed_bytes_per_second": round(total / duration, 2),
+    }
 
 
 async def download_with_fallback(
@@ -311,10 +358,11 @@ async def download_with_fallback(
         try:
             result = await stream_to_file(url, file_path, progress_cb, headers=headers, cancel_check=cancel_check)
             if job_id is not None:
+                success_message = download_summary(label, result)
                 db.add_event(
                     job_id,
                     "download:success",
-                    f"Downloaded with {label}",
+                    success_message,
                     {
                         "attempt": index + 1,
                         "total": total_candidates,
@@ -323,6 +371,8 @@ async def download_with_fallback(
                         "host": safe_url_host(url),
                         "bytes": result["bytes"],
                         "expected_size_bytes": result["expected_size_bytes"],
+                        "duration_seconds": result["duration_seconds"],
+                        "speed_bytes_per_second": result["speed_bytes_per_second"],
                     },
                 )
             return {
