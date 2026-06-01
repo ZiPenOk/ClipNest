@@ -283,6 +283,85 @@ async def probe_range_size(url: str, headers: dict[str, str]) -> dict[str, Any]:
             }
 
 
+async def probe_candidate_speed(candidate: dict[str, str], headers: dict[str, str], probe_bytes: int = 512 * 1024) -> dict[str, Any]:
+    url = candidate["url"]
+    probe_headers = build_video_download_headers(headers)
+    probe_headers["Range"] = f"bytes=0-{probe_bytes - 1}"
+    total = 0
+    started = asyncio.get_running_loop().time()
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with client.stream("GET", url, headers=probe_headers) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total >= probe_bytes:
+                    break
+    duration = max(0.001, asyncio.get_running_loop().time() - started)
+    return {
+        "key": candidate.get("key"),
+        "label": candidate.get("label"),
+        "host": safe_url_host(url),
+        "speed_bytes_per_second": round(total / duration, 2),
+        "bytes": total,
+        "duration_seconds": round(duration, 3),
+    }
+
+
+async def reorder_candidates_by_probe(
+    candidates: list[dict[str, str]],
+    headers: dict[str, str],
+    job_id: int | None = None,
+    limit: int = 6,
+) -> list[dict[str, str]]:
+    if len(candidates) <= 1:
+        return candidates
+    probe_targets = candidates[:max(1, min(limit, len(candidates)))]
+    results = await asyncio.gather(
+        *(probe_candidate_speed(candidate, headers) for candidate in probe_targets),
+        return_exceptions=True,
+    )
+    speeds: dict[str, float] = {}
+    event_results: list[dict[str, Any]] = []
+    for candidate, result in zip(probe_targets, results, strict=False):
+        if isinstance(result, Exception):
+            event_results.append(
+                {
+                    "key": candidate.get("key"),
+                    "label": candidate.get("label"),
+                    "host": safe_url_host(candidate.get("url") or ""),
+                    "error": f"{type(result).__name__}: {str(result)[:160]}",
+                }
+            )
+            continue
+        speeds[str(candidate.get("url") or "")] = float(result.get("speed_bytes_per_second") or 0)
+        event_results.append(result)
+    if not speeds:
+        return candidates
+    ranked_probe_targets = sorted(
+        probe_targets,
+        key=lambda candidate: speeds.get(str(candidate.get("url") or ""), 0),
+        reverse=True,
+    )
+    selected = ranked_probe_targets[0]
+    if job_id is not None:
+        db.add_event(
+            job_id,
+            "download:probe",
+            f"Selected {selected.get('label')} after speed probe",
+            {
+                "selected_key": selected.get("key"),
+                "selected_label": selected.get("label"),
+                "selected_host": safe_url_host(selected.get("url") or ""),
+                "probed": event_results,
+            },
+        )
+    remaining = [candidate for candidate in candidates if candidate not in ranked_probe_targets]
+    return ranked_probe_targets + remaining
+
+
 def download_candidate_event_data(candidates: list[dict[str, str]], quality_preference: str | None) -> dict[str, Any]:
     return {
         "count": len(candidates),
@@ -472,6 +551,7 @@ async def download_with_fallback(
     cancel_check=None,
 ) -> dict[str, Any]:
     errors: list[str] = []
+    candidates = await reorder_candidates_by_probe(candidates, headers, job_id=job_id)
     total_candidates = len(candidates)
     for index, candidate in enumerate(candidates):
         label = candidate["label"]
@@ -498,7 +578,7 @@ async def download_with_fallback(
         try:
             video_headers = build_video_download_headers(headers)
             probe = await probe_range_size(url, video_headers)
-            if probe.get("range_supported") and int(probe.get("total_size") or 0) >= 2 * 1024 * 1024:
+            if probe.get("range_supported") and int(probe.get("total_size") or 0) >= 64 * 1024 * 1024:
                 try:
                     result = await segmented_stream_to_file(
                         url,
