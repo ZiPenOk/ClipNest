@@ -235,7 +235,7 @@ class NativeDouyinParserAdapter:
 
     async def resolve_sec_uid(self, url: str) -> str:
         direct = self.extract_sec_uid(url)
-        if direct:
+        if direct and direct.lower() != "self":
             return direct
         timeout = httpx.Timeout(15.0, connect=5.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:

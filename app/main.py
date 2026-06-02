@@ -19,11 +19,13 @@ from .config import settings
 from .downloader import build_download_headers, ordered_bit_rate_candidates, relative_media_path
 from .notifier import send_telegram
 from .parser import NativeDouyinParserAdapter, ParserClient, author_name_from_payload
+from .telegram_bot import TelegramBotWorker
 from .worker import AuthorCrawlWorker, DownloadWorker
 
 
 worker = DownloadWorker()
 author_worker = AuthorCrawlWorker()
+telegram_bot_worker = TelegramBotWorker()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
@@ -325,9 +327,11 @@ async def lifespan(app: FastAPI):
     if settings.worker_enabled:
         worker.start()
         author_worker.start()
+    telegram_bot_worker.start()
     try:
         yield
     finally:
+        await telegram_bot_worker.stop()
         if settings.worker_enabled:
             await worker.stop()
             await author_worker.stop()

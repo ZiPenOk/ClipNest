@@ -52,15 +52,21 @@ def fmt_duration(value: Any) -> str:
     return f"{minute}:{sec:02d}"
 
 
+def quality_text(job: dict[str, Any]) -> str:
+    label = str(job.get("download_label") or "").strip()
+    if label:
+        return label
+    return f"{job.get('resolution') or '-'} / {str(job.get('codec') or '-').upper()}"
+
+
 def telegram_text(job: dict[str, Any], event: str) -> str:
     if event == "success":
-        quality = f"{job.get('resolution') or '-'} / {str(job.get('codec') or '-').upper()}"
         lines = [
             "✅ ClipNest 下载完成",
             "",
             f"🎬 标题：{job_title(job)}",
             f"👤 作者：{job.get('author_name') or 'Unknown'}",
-            f"🎞️ 清晰度：{quality}",
+            f"🎞️ 清晰度：{quality_text(job)}",
         ]
         size = fmt_bytes(job.get("size_bytes"))
         duration = fmt_duration(job.get("duration_seconds"))
@@ -70,7 +76,11 @@ def telegram_text(job: dict[str, Any], event: str) -> str:
             lines.append(f"⏱️ 时长：{duration}")
         if job.get("file_path"):
             lines.extend(["", f"📁 文件：{job.get('file_path')}"])
+        if job.get("url"):
+            lines.append(f"🔗 链接：{job.get('url')}")
+        lines.append(f"🧾 任务：#{job.get('id')}")
         return "\n".join(lines)
+
     lines = [
         "❌ ClipNest 下载失败",
         "",
@@ -81,15 +91,28 @@ def telegram_text(job: dict[str, Any], event: str) -> str:
     error = str(job.get("error") or "").splitlines()[0][:260]
     if error:
         lines.append(f"🧯 错误：{error}")
+    if job.get("url"):
+        lines.append(f"🔗 链接：{job.get('url')}")
+    lines.append(f"🧾 任务：#{job.get('id')}")
     return "\n".join(lines)
 
 
-async def send_telegram(settings: dict[str, Any], text: str) -> dict[str, Any]:
-    token = str(settings.get("telegram_bot_token") or "").strip()
-    chat_id = str(settings.get("telegram_chat_id") or "").strip()
+async def send_telegram_message(
+    token: str,
+    chat_id: str,
+    text: str,
+    *,
+    reply_markup: dict[str, Any] | None = None,
+    reply_to_message_id: int | None = None,
+) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
     async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(url, json={"chat_id": chat_id, "text": text})
+        response = await client.post(url, json=payload)
     if response.status_code >= 400:
         description = response.text[:240]
         try:
@@ -103,6 +126,12 @@ async def send_telegram(settings: dict[str, Any], text: str) -> dict[str, Any]:
     except ValueError:
         data = {"ok": True}
     return data if isinstance(data, dict) else {"ok": True}
+
+
+async def send_telegram(settings: dict[str, Any], text: str) -> dict[str, Any]:
+    token = str(settings.get("telegram_bot_token") or "").strip()
+    chat_id = str(settings.get("telegram_chat_id") or "").strip()
+    return await send_telegram_message(token, chat_id, text)
 
 
 async def notify_job(job: dict[str, Any] | None, event: str) -> None:

@@ -1,24 +1,26 @@
 # ClipNest
 
-ClipNest 是一个面向家庭 Docker/NAS 的抖音作品下载和媒体库工具。
+ClipNest 是一个面向家庭 Docker/NAS 的抖音下载和媒体库工具。它不是单纯的“解析链接下载器”，而是把抖音作品、图集、作者主页抓取、远程推送、Telegram 反向下载统一收进家里的媒体库。
 
-它不是单纯的“解析链接下载器”，而是把刷到的抖音视频、图集、作者作品批量抓取任务，统一收进家里的媒体库里。当前项目只面向抖音，不包含 TikTok。
+当前项目只面向抖音，不包含 TikTok。
 
 ## 主要功能
 
 - 抖音视频和图集解析下载
 - 默认选择可用的最高画质，优先保留 H.265/HEVC 高画质候选
-- Web 工作台查看队列、进度、统计和运行状态
+- 单连接 Range 下载，接近浏览器行为，避免多线程分片带来的额外请求风险
+- 下载进度使用内存状态，SQL 只保存关键状态和最终结果
+- Web 工作台查看队列、进度、统计、最近事件和运行状态
 - 媒体库按作者和作品分页浏览
 - 作者详情页支持更新该作者作品
 - 作者主页批量抓取，支持暂停、继续、取消
-- 下载完成后本地预览视频、封面和图片
-- 文件按作者分类保存
-- 文件名模板和非法字符清理
 - 远程 API 推送下载任务
 - 浏览器脚本一键推送当前抖音作品
+- Telegram 反向下载：给机器人发送作品链接或作者主页链接即可入队
 - Telegram 下载完成/失败通知
-- Cookie、解析器、健康信息、最近事件、孤儿文件等维护面板
+- 文件按作者分类保存
+- 文件名模板、非法字符清理、同名文件自动避让
+- Cookie、解析器、健康信息、孤儿文件、重复文件等维护面板
 - SQLite 本地数据库
 - 单容器运行，容器内 Web 和 Worker 使用独立进程
 
@@ -67,11 +69,11 @@ docker compose up -d
 http://你的群晖IP:8090
 ```
 
-首次登录使用 `.env` 里的 `CLIPNEST_API_TOKEN`。脚本或 API 请求也使用同一个 Token。
+首次登录使用 `.env` 里的 `CLIPNEST_API_TOKEN`。脚本和 API 请求也使用同一个 Token。
 
 ## 群晖目录建议
 
-推荐放在：
+项目目录推荐放在：
 
 ```text
 /volume1/docker/clipnest
@@ -92,7 +94,7 @@ downloads/ 作品文件、封面、头像缓存
 
 ## 本地开发
 
-如果要在群晖上直接改源码并热重启，可以使用开发 override：
+如果要在群晖上直接改源码并重启，可以使用开发 override：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
@@ -164,7 +166,7 @@ GET 形式适合书签、快捷指令或简单脚本：
 http://你的群晖IP:8090/api/push?token=replace-this-token&url=https%3A%2F%2Fv.douyin.com%2Fexample%2F
 ```
 
-容器入口已关闭 Uvicorn access log，避免 GET 推送里的 token query 被写进容器访问日志。
+容器入口已关闭 Uvicorn access log，避免 GET 推送里的 token query 被写进访问日志。
 
 ## 浏览器推送脚本
 
@@ -182,6 +184,53 @@ tools/clipnest-douyin-push.user.js
 
 脚本会尽量识别 `/video/`、`/note/`、移动分享页、`modal_id` 和页面里的 `awemeInfo`。
 
+## Telegram 反向下载
+
+在设置页填写：
+
+- Telegram Bot Token
+- Telegram Chat ID
+- 是否通知下载完成
+- 是否通知下载失败
+
+点击“发送 TG 测试”可以验证配置。
+
+配置完成后，可以直接给机器人发送：
+
+- 抖音作品链接：创建单个下载任务
+- 抖音作者主页链接：创建作者抓取任务，后台抓取作者作品并加入下载队列
+- `/status`：查看当前下载任务和作者抓取任务
+- `/help`：查看简短说明
+
+Telegram 交互流程：
+
+```text
+📥 ClipNest 已收到下载链接
+
+🔗 链接：https://www.douyin.com/video/...
+
+🧾 ClipNest 下载任务已创建
+
+🔗 链接：https://www.douyin.com/video/...
+🧾 任务：#152
+
+✅ ClipNest 下载完成
+
+🎬 标题：...
+👤 作者：...
+🎞️ 清晰度：bit-rate 2160x3840@59 h265
+📦 大小：4.0 MB
+⏱️ 时长：0:10
+
+📁 文件：/downloads/douyin/作者/作者：标题.mp4
+🔗 链接：https://www.douyin.com/video/...
+🧾 任务：#152
+```
+
+作者主页链接会显示“作者抓取任务已创建”，并提供“刷新作者抓取”按钮。
+
+![Telegram 反向下载示例](docs/images/telegram-download-flow.jpg)
+
 ## 作者抓取
 
 工作台可以填写作者主页链接，创建作者抓取任务。任务会在后台分页抓取作品并加入下载队列。
@@ -194,20 +243,11 @@ tools/clipnest-douyin-push.user.js
 
 媒体库作者详情页也可以直接点击“更新该作者作品”。
 
-## Telegram 通知
+Telegram 中发送 `/user/...` 作者页链接时，也会创建同样的作者抓取任务。即使作者页链接带有 `vid` 或 `modal_id`，也会按作者主页处理，而不是只下载当前视频。
 
-设置页填写：
+## 文件命名
 
-- Telegram Bot Token
-- Telegram Chat ID
-- 是否通知下载完成
-- 是否通知下载失败
-
-可以点击“发送 TG 测试”验证配置。下载完成通知会包含标题、作者、清晰度、大小、时长和本地文件路径。
-
-## 存储结构
-
-默认文件结构：
+默认保存结构：
 
 ```text
 downloads/
@@ -216,6 +256,27 @@ downloads/
       作者名：作品描述.mp4
       作者名：作品描述.jpg
 ```
+
+默认文件名模板：
+
+```text
+{author}：{desc}
+```
+
+如果不同链接但标题相同，ClipNest 会先按 `platform + video_id` 判断是否真的是同一个作品。
+
+- 同一个作品：复用已下载文件
+- 不同作品但文件名相同：自动加后缀避免覆盖
+
+示例：
+
+```text
+作者：相同标题.mp4
+作者：相同标题-7639689018468436971.mp4
+作者：相同标题-2.mp4
+```
+
+## 存储结构
 
 封面和头像缓存位于：
 

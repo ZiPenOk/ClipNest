@@ -82,6 +82,23 @@ def build_paths(
     return str(target_dir / filename), str(target_dir / (Path(filename).stem + ".jpg"))
 
 
+def avoid_video_filename_collision(file_path: str, preview_path: str, payload: dict[str, Any]) -> tuple[str, str]:
+    if not os.path.exists(file_path):
+        return file_path, preview_path
+
+    base = Path(file_path)
+    video_id = sanitize_filename_part(payload.get("video_id"), "")
+    suffixes = [video_id] if video_id else []
+    suffixes.extend(str(index) for index in range(2, 1000))
+
+    for suffix in suffixes:
+        candidate_name = limit_bytes(f"{base.stem}-{suffix}") + base.suffix
+        candidate = base.with_name(candidate_name)
+        if not candidate.exists():
+            return str(candidate), str(candidate.with_suffix(".jpg"))
+    raise RuntimeError("Could not allocate a collision-free filename")
+
+
 def build_image_paths(payload: dict[str, Any], app_settings: dict[str, Any] | None = None, count: int = 1) -> list[str]:
     video_path, _ = build_paths(payload, app_settings=app_settings)
     folder = Path(video_path).with_suffix("")
@@ -950,6 +967,20 @@ async def process_download(job: dict[str, Any], update_cb, cancel_check=None) ->
             finished_at=utc_now(),
         )
         return
+
+    original_file_path = file_path
+    file_path, preview_path = avoid_video_filename_collision(file_path, preview_path, payload)
+    if file_path != original_file_path:
+        db.add_event(
+            job_id,
+            "filename:collision",
+            "Filename already exists; using a unique filename",
+            {
+                "original_file_path": original_file_path,
+                "file_path": file_path,
+                "video_id": str(payload.get("video_id") or ""),
+            },
+        )
 
     if app_settings.get("skip_existing", True) and os.path.exists(file_path):
         media = inspect_media(file_path)
