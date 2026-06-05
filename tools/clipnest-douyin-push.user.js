@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ClipNest Douyin Remote Push
 // @namespace    https://clipnest.local/userscripts
-// @version      2026.05.31.10
+// @version      2026.06.02.1
 // @description  Detect the current Douyin video/note and push it to ClipNest for remote download.
 // @author       ClipNest
 // @match        *://*.douyin.com/*
@@ -97,6 +97,7 @@
       source: item.source || "unknown",
       desc: item.desc || "",
       author: item.author || "",
+      cover_url: item.cover_url || "",
     };
   }
 
@@ -179,6 +180,94 @@
     return "";
   }
 
+  function normalizeImageUrl(value) {
+    if (typeof value !== "string" || !value.trim()) {
+      return "";
+    }
+    const raw = value.trim().replace(/&amp;/g, "&");
+    try {
+      const url = new URL(raw, location.href);
+      if (!url.hostname.includes("douyinpic.com")) {
+        return "";
+      }
+      return url.toString();
+    } catch {
+      return "";
+    }
+  }
+
+  function coverUrlScore(url) {
+    let score = 0;
+    if (!url) return score;
+    if (url.includes("cropcenter")) score += 100;
+    if (url.includes("PackSourceEnum_PUBLISH")) score += 35;
+    if (url.includes("dynamic_cover") || url.includes("/obj/tos-cn-i-")) score += 60;
+    if (url.includes("origin_cover")) score += 35;
+    if (url.includes("pcweb_cover")) score += 20;
+    if (url.includes("image-cut-tos-priv")) score -= 10;
+    return score;
+  }
+
+  function betterCoverUrl(left, right) {
+    if (!left) return right || "";
+    if (!right) return left || "";
+    return coverUrlScore(right) > coverUrlScore(left) ? right : left;
+  }
+
+  function coverUrlFromCssValue(value) {
+    if (typeof value !== "string" || !value.includes("url(")) {
+      return "";
+    }
+    let best = "";
+    const matches = value.matchAll(/url\((['"]?)(.*?)\1\)/g);
+    for (const match of matches) {
+      best = betterCoverUrl(best, normalizeImageUrl(match[2]));
+    }
+    return best;
+  }
+
+  function coverUrlFromValue(value, depth = 0, seen = new WeakSet(), budget = { count: 0 }) {
+    const direct = normalizeImageUrl(value);
+    if (direct) {
+      return direct;
+    }
+    if (!isPlainSearchableObject(value) || depth > 4 || budget.count > 320) {
+      return "";
+    }
+    if (seen.has(value)) {
+      return "";
+    }
+    seen.add(value);
+    budget.count += 1;
+
+    let best = "";
+    const priorityKeys = [
+      "pc_card_cover",
+      "pcCardCover",
+      "coverUrl",
+      "cover_url",
+      "dynamic_cover",
+      "dynamicCover",
+      "origin_cover",
+      "originCover",
+      "cover",
+      "imagePostCover",
+      "url_list",
+      "urlList",
+      "src",
+    ];
+    for (const key of priorityKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        best = betterCoverUrl(best, coverUrlFromValue(value[key], depth + 1, seen, budget));
+      }
+    }
+    const keys = Object.keys(value).slice(0, 50);
+    for (const key of keys) {
+      best = betterCoverUrl(best, coverUrlFromValue(value[key], depth + 1, seen, budget));
+    }
+    return best;
+  }
+
   function awemeIdFromObject(value) {
     return getObjectText(value, ["aweme_id", "awemeId", "group_id", "groupId", "item_id", "itemId"]);
   }
@@ -219,6 +308,7 @@
         "unique_id",
         "uniqueId",
       ]),
+      cover_url: coverUrlFromValue(value),
     });
   }
 
@@ -346,6 +436,44 @@
     return uniqueElements([...playingVideos, ...centerElements, ...knownContainers]);
   }
 
+  function detectCoverFromDom(rootElement) {
+    const roots = uniqueElements([
+      rootElement,
+      rootElement && rootElement.closest && rootElement.closest(".basePlayerContainer"),
+      rootElement && rootElement.closest && rootElement.closest("[data-e2e='feed-video']"),
+      ...candidateElements(),
+    ]).filter(Boolean);
+    let best = "";
+    for (const root of roots) {
+      const images = [];
+      if (root instanceof HTMLImageElement) {
+        images.push(root);
+      }
+      if (root.querySelectorAll) {
+        images.push(...root.querySelectorAll("img"));
+      }
+      for (const image of images) {
+        if (!isVisible(image)) {
+          continue;
+        }
+        best = betterCoverUrl(best, normalizeImageUrl(image.currentSrc || image.src || image.getAttribute("src")));
+      }
+      const nodes = root.querySelectorAll ? [root, ...Array.from(root.querySelectorAll("*")).slice(0, 140)] : [root];
+      for (const node of nodes) {
+        if (!isVisible(node)) {
+          continue;
+        }
+        best = betterCoverUrl(best, coverUrlFromCssValue(node.style && node.style.backgroundImage));
+        try {
+          best = betterCoverUrl(best, coverUrlFromCssValue(getComputedStyle(node).backgroundImage));
+        } catch {
+          // Ignore detached nodes.
+        }
+      }
+    }
+    return best;
+  }
+
   function detectFromReact(rootElement) {
     const elements = rootElement ? [rootElement] : candidateElements();
     for (const element of elements) {
@@ -385,12 +513,16 @@
   }
 
   function detectCurrentItem(rootElement) {
-    return (
+    const item = (
       detectFromUrl(location.href, { includeQuery: false }) ||
       detectFromReact(rootElement) ||
       detectFromUrl(location.href, { includeQuery: true }) ||
       detectFromRouterData()
     );
+    if (item && !item.cover_url) {
+      item.cover_url = detectCoverFromDom(rootElement);
+    }
+    return item;
   }
 
   function requestJson(url, payload) {
@@ -441,6 +573,9 @@
     if (dryRun) {
       params.set("dry_run", "true");
     }
+    if (item.cover_url) {
+      params.set("cover_url", item.cover_url);
+    }
     window.open(`${getBaseUrl()}/api/push?${params.toString()}`, "_blank", "noopener,noreferrer");
   }
 
@@ -466,6 +601,7 @@
       const payload = {
         url: item.url,
         quality_preference: getQuality(),
+        cover_url: item.cover_url || "",
         dry_run: Boolean(dryRun),
       };
       const result = await requestJson(`${getBaseUrl()}/api/push`, payload);

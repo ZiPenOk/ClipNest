@@ -11,7 +11,7 @@ import httpx
 
 from . import db
 from .assets import author_avatar_url_from_payload, cache_remote_image, cover_url_from_payload
-from .config import settings
+from .config import normalize_cookie_header, settings
 from .db import utc_now
 from .parser import ParserClient, author_name_from_payload
 
@@ -117,10 +117,26 @@ def build_download_headers(payload: dict[str, Any], parser_settings: dict[str, A
     }
     if platform == "douyin":
         headers["Referer"] = "https://www.douyin.com/"
-        cookie = str(parser_settings.get("douyin_cookie") or settings.douyin_cookie or "")
+        cookie = normalize_cookie_header(parser_settings.get("douyin_cookie") or settings.douyin_cookie or "")
+        if cookie:
+            headers["Cookie"] = cookie
+    elif platform == "tiktok":
+        headers["Referer"] = "https://www.tiktok.com/"
+        headers["Accept-Language"] = "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"
+        headers["User-Agent"] = str(parser_settings.get("tiktok_user_agent") or settings.tiktok_user_agent)
+        cookie = normalize_cookie_header(parser_settings.get("tiktok_cookie") or settings.tiktok_cookie or "")
         if cookie:
             headers["Cookie"] = cookie
     return headers
+
+
+def preferred_job_cover_url(job: dict[str, Any]) -> str:
+    url = str(job.get("cover_url") or "").strip()
+    if "douyinpic.com" not in url:
+        return ""
+    if "cropcenter" in url or "PackSourceEnum_PUBLISH" in url or "/obj/tos-cn-i-" in url:
+        return url
+    return ""
 
 
 def build_video_download_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -759,30 +775,6 @@ def inspect_media(file_path: str) -> dict[str, Any]:
     return result
 
 
-def generate_preview(file_path: str, preview_path: str) -> str | None:
-    try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                "1",
-                "-i",
-                file_path,
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale=480:-1",
-                preview_path,
-            ],
-            capture_output=True,
-            timeout=30,
-        )
-    except Exception:
-        return None
-    return preview_path if os.path.exists(preview_path) else None
-
-
 def fresh_cached_payload(job: dict[str, Any]) -> dict[str, Any] | None:
     payload = job.get("metadata")
     if not isinstance(payload, dict):
@@ -819,14 +811,15 @@ async def process_download(job: dict[str, Any], update_cb, cancel_check=None) ->
     await ensure_not_cancelled()
     author = author_name_from_payload(payload)
     video_data = payload.get("video_data") or {}
-    parser_source = str(payload.get("parser_source") or parser.adapter.name)
+    adapter_name = str(payload.get("_clipnest_adapter_name") or parser.adapter.name)
+    parser_source = str(payload.get("parser_source") or adapter_name)
     bit_rate_count = len(video_data.get("bit_rate_candidates") or [])
     db.add_event(
         job_id,
         "parse:success",
-        f"Parsed via {parser.adapter.name} / {parser_source}",
+        f"Parsed via {adapter_name} / {parser_source}",
         {
-            "adapter": parser.adapter.name,
+            "adapter": adapter_name,
             "source": parser_source,
             "video_id": str(payload.get("video_id") or ""),
             "bit_rate_candidates": bit_rate_count,
@@ -834,7 +827,7 @@ async def process_download(job: dict[str, Any], update_cb, cancel_check=None) ->
         },
     )
     file_path, preview_path = build_paths(payload, app_settings=app_settings)
-    cover_url = cover_url_from_payload(payload)
+    cover_url = preferred_job_cover_url(job) or cover_url_from_payload(payload)
     avatar_url = author_avatar_url_from_payload(payload)
     cover_path = ""
     avatar_path = ""
@@ -953,7 +946,7 @@ async def process_download(job: dict[str, Any], update_cb, cancel_check=None) ->
             progress=100,
             message=f"Already downloaded as job #{duplicate.get('id')}",
             file_path=duplicate.get("file_path"),
-            preview_path=duplicate.get("preview_path"),
+            preview_path=cover_path or duplicate.get("cover_path") or None,
             size_bytes=duplicate.get("size_bytes"),
             expected_size_bytes=duplicate.get("expected_size_bytes") or duplicate.get("size_bytes"),
             duration_seconds=duplicate.get("duration_seconds"),
@@ -989,7 +982,7 @@ async def process_download(job: dict[str, Any], update_cb, cancel_check=None) ->
             progress=100,
             message="Already downloaded",
             file_path=file_path,
-            preview_path=preview_path if os.path.exists(preview_path) else None,
+            preview_path=cover_path or None,
             size_bytes=os.path.getsize(file_path),
             expected_size_bytes=os.path.getsize(file_path),
             error_type="",
@@ -1035,13 +1028,12 @@ async def process_download(job: dict[str, Any], update_cb, cancel_check=None) ->
     await update_cb(progress=96, message="Inspecting")
     media = await asyncio.to_thread(inspect_media, file_path)
     await ensure_not_cancelled()
-    preview = await asyncio.to_thread(generate_preview, file_path, preview_path)
     await update_cb(
         status="finished",
         progress=100,
         message="Finished",
         file_path=file_path,
-        preview_path=preview,
+        preview_path=cover_path or None,
         size_bytes=download_info.get("bytes") or os.path.getsize(file_path),
         error_type="",
         next_attempt_at=None,

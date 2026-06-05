@@ -15,6 +15,7 @@ from .notifier import send_telegram_message
 URL_RE = re.compile(r"https?://\S+")
 TRAILING_URL_PUNCTUATION = ".,;:!?)]}>，。；：！？）】》"
 DOUYIN_HOST_RE = re.compile(r"(^|\.)((douyin|iesdouyin)\.com)$", re.I)
+TIKTOK_HOST_RE = re.compile(r"(^|\.)tiktok\.com$", re.I)
 RUNNING_CRAWL_STATUSES = {"queued", "running", "paused", "pausing", "cancelling"}
 STATUS_LABELS = {
     "queued": "排队中",
@@ -50,6 +51,18 @@ def is_douyin_url(url: str) -> bool:
     return bool(DOUYIN_HOST_RE.search(host))
 
 
+def is_tiktok_url(url: str) -> bool:
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    return bool(TIKTOK_HOST_RE.search(host))
+
+
+def is_supported_url(url: str) -> bool:
+    return is_douyin_url(url) or is_tiktok_url(url)
+
+
 def is_author_url(url: str) -> bool:
     try:
         path = urlsplit(url).path
@@ -58,12 +71,12 @@ def is_author_url(url: str) -> bool:
     return path.startswith("/user/") or path.startswith("/share/user/")
 
 
-def extract_douyin_urls(text: str) -> list[str]:
+def extract_supported_urls(text: str) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     for candidate in URL_RE.findall(text or ""):
         url = clean_url(candidate)
-        if url in seen or not is_douyin_url(url):
+        if url in seen or not is_supported_url(url):
             continue
         urls.append(url)
         seen.add(url)
@@ -353,26 +366,26 @@ class TelegramBotWorker:
             await send_telegram_message(
                 token,
                 chat_id,
-                "把抖音作品链接或作者主页链接发给我，我会加入 ClipNest 队列。\n/status 查看当前任务。",
+                "把抖音/TikTok 作品链接，或抖音作者主页链接发给我，我会加入 ClipNest 队列。\n/status 查看当前任务。",
                 reply_to_message_id=message_id,
             )
             return
         if text.startswith("/status"):
             await send_telegram_message(token, chat_id, active_jobs_text(), reply_to_message_id=message_id)
             return
-        urls = extract_douyin_urls(text)
+        urls = extract_supported_urls(text)
         if not urls:
             await send_telegram_message(
                 token,
                 chat_id,
-                "没有识别到抖音链接。\n直接发送作品链接/作者主页链接，或发送 /status 查看队列。",
+                "没有识别到支持的链接。\n直接发送抖音/TikTok 作品链接、抖音作者主页链接，或发送 /status 查看队列。",
                 reply_to_message_id=message_id,
             )
             return
 
         await self.send_received_messages(token, chat_id, message_id, urls)
-        author_urls = [url for url in urls if is_author_url(url)]
-        video_urls = [url for url in urls if not is_author_url(url)]
+        author_urls = [url for url in urls if is_douyin_url(url) and is_author_url(url)]
+        video_urls = [url for url in urls if url not in author_urls]
         crawls = [
             db.create_author_crawl_job(
                 url,

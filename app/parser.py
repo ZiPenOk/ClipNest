@@ -1,12 +1,13 @@
 import asyncio
+import html
 import json
 import re
 from typing import Any, Protocol
-from urllib.parse import unquote, urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from .config import settings
+from .config import normalize_cookie_header, settings
 
 
 class ParserError(RuntimeError):
@@ -248,7 +249,7 @@ class NativeDouyinParserAdapter:
 
     def request_headers(self) -> dict[str, str]:
         user_agent = str(self.parser_settings.get("douyin_user_agent") or settings.douyin_user_agent)
-        douyin_cookie = str(self.parser_settings.get("douyin_cookie") or settings.douyin_cookie)
+        douyin_cookie = normalize_cookie_header(self.parser_settings.get("douyin_cookie") or settings.douyin_cookie)
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -260,7 +261,7 @@ class NativeDouyinParserAdapter:
         return headers
 
     def mobile_request_headers(self) -> dict[str, str]:
-        douyin_cookie = str(self.parser_settings.get("douyin_cookie") or settings.douyin_cookie)
+        douyin_cookie = normalize_cookie_header(self.parser_settings.get("douyin_cookie") or settings.douyin_cookie)
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -601,6 +602,302 @@ class NativeDouyinShareParserAdapter(NativeDouyinParserAdapter):
         }
 
 
+def first_tiktok_url(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            url = first_tiktok_url(item)
+            if url:
+                return url
+    if isinstance(value, dict):
+        for key in ("UrlList", "url_list", "urls"):
+            url = first_tiktok_url(value.get(key))
+            if url:
+                return url
+    if isinstance(value, str):
+        url = value.strip().split()[0] if value.strip() else ""
+        if url.startswith("//"):
+            return f"https:{url}"
+        return url
+    return ""
+
+
+def all_tiktok_urls(value: Any) -> list[str]:
+    urls: list[str] = []
+    raw = value
+    if isinstance(value, dict):
+        raw = value.get("UrlList") or value.get("url_list") or value.get("urls") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        for item in raw:
+            url = first_tiktok_url(item)
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+class NativeTikTokParserAdapter:
+    name = "native_tiktok"
+    _ID_PATTERNS = (
+        re.compile(r"/video/(\d+)"),
+        re.compile(r"[?&](?:item_id|video_id)=(\d+)"),
+    )
+    _JSON_SCRIPT_RE = re.compile(
+        r'<script[^>]+id=["\'](?P<id>SIGI_STATE|__UNIVERSAL_DATA_FOR_REHYDRATION__)["\'][^>]*>(?P<body>.*?)</script>',
+        re.S,
+    )
+
+    def __init__(self, parser_settings: dict[str, Any] | None = None):
+        self.parser_settings = parser_settings or {}
+
+    async def parse(self, url: str) -> dict[str, Any]:
+        page_url = url
+        page_html = ""
+        item: dict[str, Any] | None = None
+        video_id = self.extract_video_id(url)
+        last_error: Exception | None = None
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            try:
+                page_url, page_html = await self.fetch_video_page(url, attempt=attempt)
+                video_id = self.extract_video_id(page_url) or video_id
+                item = self.extract_item_from_html(page_html, video_id)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(0.35 * (attempt + 1))
+                    continue
+                raise ParserError(f"TikTok parse failed after retries: {exc}") from exc
+        if not item:
+            raise ParserError(f"TikTok parse failed: {last_error}")
+        item_id = str(item.get("id") or video_id or "").strip()
+        if not item_id:
+            raise ParserError("TikTok page did not contain a video id")
+        result = self.normalize_item(item_id, item)
+        result["parser_source"] = "web_page_json"
+        result["source_url"] = page_url
+        return result
+
+    async def fetch_video_page(self, url: str, attempt: int = 0) -> tuple[str, str]:
+        timeout = httpx.Timeout(20.0, connect=8.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=self.request_headers(url, attempt=attempt))
+            canonical_url = self.canonical_video_url(str(response.url))
+            if canonical_url and canonical_url != str(response.url):
+                response = await client.get(canonical_url, headers=self.request_headers(canonical_url, attempt=attempt))
+        if response.status_code >= 400:
+            raise ParserError(f"TikTok page returned HTTP {response.status_code}: {response.text[:240]}")
+        return str(response.url), response.text
+
+    @classmethod
+    def extract_video_id(cls, url: str) -> str | None:
+        for pattern in cls._ID_PATTERNS:
+            match = pattern.search(url)
+            if match:
+                return match.group(1)
+        return None
+
+    @classmethod
+    def canonical_video_url(cls, url: str) -> str:
+        if not cls.extract_video_id(url):
+            return url
+        parts = urlsplit(url)
+        if not parts.query and not parts.fragment:
+            return url
+        return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+
+    def request_headers(self, url: str | None = None, attempt: int = 0) -> dict[str, str]:
+        desktop_user_agent = str(self.parser_settings.get("tiktok_user_agent") or settings.tiktok_user_agent)
+        mobile_user_agent = (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+            "Mobile/15E148 Safari/604.1"
+        )
+        user_agent = mobile_user_agent if attempt % 2 else desktop_user_agent
+        tiktok_cookie = normalize_cookie_header(self.parser_settings.get("tiktok_cookie") or settings.tiktok_cookie)
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+            "Referer": "https://www.tiktok.com/",
+            "User-Agent": user_agent,
+        }
+        if url:
+            headers["Referer"] = url
+        if tiktok_cookie:
+            headers["Cookie"] = tiktok_cookie
+        return headers
+
+    @classmethod
+    def extract_item_from_html(cls, page_html: str, video_id: str | None = None) -> dict[str, Any]:
+        errors: list[str] = []
+        for match in cls._JSON_SCRIPT_RE.finditer(page_html):
+            raw = html.unescape(match.group("body") or "").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                errors.append(f"{match.group('id')}: {exc}")
+                continue
+            item = cls.find_item_struct(data, video_id)
+            if item:
+                return item
+        if errors:
+            raise ParserError("TikTok page JSON could not be parsed: " + "; ".join(errors[:2]))
+        raise ParserError("TikTok page did not contain supported video JSON")
+
+    @classmethod
+    def find_item_struct(cls, data: Any, video_id: str | None = None) -> dict[str, Any] | None:
+        stack = [data]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                item_module = current.get("ItemModule")
+                if isinstance(item_module, dict) and video_id:
+                    item = item_module.get(video_id)
+                    if cls.looks_like_item(item, video_id):
+                        return item
+                item_info = current.get("itemInfo")
+                if isinstance(item_info, dict):
+                    item_struct = item_info.get("itemStruct")
+                    if cls.looks_like_item(item_struct, video_id):
+                        return item_struct
+                item_struct = current.get("itemStruct")
+                if cls.looks_like_item(item_struct, video_id):
+                    return item_struct
+                if cls.looks_like_item(current, video_id):
+                    return current
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+        return None
+
+    @staticmethod
+    def looks_like_item(value: Any, video_id: str | None = None) -> bool:
+        if not isinstance(value, dict):
+            return False
+        item_id = str(value.get("id") or value.get("item_id") or "").strip()
+        if video_id and item_id and item_id != str(video_id):
+            return False
+        return isinstance(value.get("video"), dict) and (bool(item_id) or bool(video_id))
+
+    @staticmethod
+    def normalize_author(author: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(author or {})
+        normalized["uid"] = str(author.get("id") or author.get("uid") or "").strip()
+        normalized["unique_id"] = str(author.get("uniqueId") or author.get("unique_id") or "").strip()
+        normalized["nickname"] = str(author.get("nickname") or normalized.get("unique_id") or "").strip()
+        for source_key, target_key in (
+            ("avatarThumb", "avatar_thumb"),
+            ("avatarMedium", "avatar_medium"),
+            ("avatarLarger", "avatar_larger"),
+        ):
+            url = first_tiktok_url(author.get(source_key) or author.get(target_key))
+            if url:
+                normalized[target_key] = {"url_list": [url]}
+        return normalized
+
+    @classmethod
+    def normalize_bitrate_candidates(cls, video: dict[str, Any]) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for index, item in enumerate(video.get("bitrateInfo") or video.get("bit_rate") or []):
+            if not isinstance(item, dict):
+                continue
+            play_addr = item.get("PlayAddr") or item.get("play_addr") or {}
+            urls = all_tiktok_urls(play_addr)
+            if not urls:
+                continue
+            codec = str(item.get("CodecType") or item.get("codec_type") or item.get("Codec") or "").lower()
+            width = int(play_addr.get("Width") or play_addr.get("width") or video.get("width") or 0)
+            height = int(play_addr.get("Height") or play_addr.get("height") or video.get("height") or 0)
+            candidates.append(
+                {
+                    "url": urls[0],
+                    "back_urls": urls[1:],
+                    "width": width,
+                    "height": height,
+                    "fps": int(item.get("FPS") or item.get("fps") or 0),
+                    "bit_rate": int(item.get("Bitrate") or item.get("bit_rate") or 0),
+                    "data_size": int(play_addr.get("DataSize") or play_addr.get("data_size") or 0),
+                    "format": item.get("Format") or item.get("format"),
+                    "gear_name": item.get("GearName") or item.get("gear_name") or f"tiktok_{index}",
+                    "quality_type": item.get("QualityType") or item.get("quality_type"),
+                    "is_h265": codec in {"h265", "hevc", "hvc1", "bytevc1"},
+                }
+            )
+        return sorted(
+            candidates,
+            key=lambda item: (
+                max(int(item.get("width") or 0), int(item.get("height") or 0)),
+                min(int(item.get("width") or 0), int(item.get("height") or 0)),
+                int(bool(item.get("is_h265"))),
+                int(item.get("data_size") or 0),
+                int(item.get("bit_rate") or 0),
+            ),
+            reverse=True,
+        )
+
+    @classmethod
+    def normalize_item(cls, item_id: str, item: dict[str, Any]) -> dict[str, Any]:
+        video = item.get("video") or {}
+        author = cls.normalize_author(item.get("author") if isinstance(item.get("author"), dict) else {})
+        play_addr = first_tiktok_url(video.get("playAddr") or video.get("play_addr"))
+        download_addr = first_tiktok_url(video.get("downloadAddr") or video.get("download_addr"))
+        cover = first_tiktok_url(video.get("cover"))
+        origin_cover = first_tiktok_url(video.get("originCover") or video.get("origin_cover"))
+        dynamic_cover = first_tiktok_url(video.get("dynamicCover") or video.get("dynamic_cover"))
+        bitrate_candidates = cls.normalize_bitrate_candidates(video)
+        best_url = bitrate_candidates[0]["url"] if bitrate_candidates else play_addr
+        result = {
+            "type": "video",
+            "platform": "tiktok",
+            "video_id": item_id,
+            "desc": item.get("desc") or item.get("description") or "",
+            "create_time": item.get("createTime") or item.get("create_time"),
+            "author": author,
+            "music": item.get("music"),
+            "statistics": item.get("stats") or item.get("statistics"),
+            "hashtags": item.get("textExtra") or item.get("text_extra"),
+            "cover_url": origin_cover or cover or dynamic_cover,
+            "cover_data": {
+                "cover": {"url_list": [cover]} if cover else {},
+                "origin_cover": {"url_list": [origin_cover]} if origin_cover else {},
+                "dynamic_cover": {"url_list": [dynamic_cover]} if dynamic_cover else {},
+            },
+            "video_data": {
+                "wm_video_url": download_addr,
+                "wm_video_url_HQ": download_addr,
+                "nwm_video_url": play_addr,
+                "nwm_video_url_HQ": best_url,
+                "bit_rate_candidates": bitrate_candidates,
+            },
+        }
+        if not best_url and not play_addr and not download_addr:
+            raise ParserError("TikTok video item did not expose playable URLs")
+        return result
+
+    async def health(self) -> dict[str, Any]:
+        return {
+            **self.info(),
+            "ok": True,
+            "stage": "web_page_json",
+            "cookie_configured": bool(self.parser_settings.get("tiktok_cookie") or settings.tiktok_cookie),
+            "warning": None,
+        }
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "adapter": self.name,
+            "detail_endpoint": "https://www.tiktok.com/@user/video/{id}",
+            "cookie_configured": bool(self.parser_settings.get("tiktok_cookie") or settings.tiktok_cookie),
+            "dependency_mode": "native_web_json",
+            "legacy_dependency": False,
+            "external_dependencies": [],
+            "capabilities": ["fetch_video_page", "extract_web_json", "normalize_item"],
+        }
+
+
 def first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
     for key in keys:
         value = mapping.get(key)
@@ -622,6 +919,14 @@ def runtime_parser_settings() -> dict[str, Any]:
     return db.get_parser_settings(include_secret=True)
 
 
+def is_tiktok_url(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
 def create_adapter(
     name: str | None = None,
     parser_settings: dict[str, Any] | None = None,
@@ -632,6 +937,8 @@ def create_adapter(
         return NativeDouyinParserAdapter(parser_settings=parser_settings)
     if adapter_name == "native_douyin_share":
         return NativeDouyinShareParserAdapter(parser_settings=parser_settings)
+    if adapter_name == "native_tiktok":
+        return NativeTikTokParserAdapter(parser_settings=parser_settings)
     raise ParserError(f"Unknown parser adapter: {adapter_name}")
 
 
@@ -641,13 +948,28 @@ class ParserClient:
         adapter: ParserAdapter | None = None,
         parser_settings: dict[str, Any] | None = None,
     ):
+        self.parser_settings = parser_settings or runtime_parser_settings()
+        self.explicit_adapter = adapter is not None
         if adapter:
             self.adapter = adapter
         else:
-            self.adapter = create_adapter(parser_settings=parser_settings)
+            self.adapter = create_adapter(parser_settings=self.parser_settings)
 
     async def parse(self, url: str) -> dict[str, Any]:
-        return await self.adapter.parse(url)
+        if not self.explicit_adapter:
+            if is_tiktok_url(url):
+                routed_adapter = NativeTikTokParserAdapter(parser_settings=self.parser_settings)
+                result = await routed_adapter.parse(url)
+                result["_clipnest_adapter_name"] = routed_adapter.name
+                return result
+            if self.adapter.name == "native_tiktok":
+                routed_adapter = NativeDouyinParserAdapter(parser_settings=self.parser_settings)
+                result = await routed_adapter.parse(url)
+                result["_clipnest_adapter_name"] = routed_adapter.name
+                return result
+        result = await self.adapter.parse(url)
+        result["_clipnest_adapter_name"] = self.adapter.name
+        return result
 
     async def health(self) -> dict[str, Any]:
         return await self.adapter.health()

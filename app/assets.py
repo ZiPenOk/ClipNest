@@ -25,11 +25,14 @@ def first_url(value) -> str:
 
 
 def cover_url_from_payload(payload: dict) -> str:
-    cover = ((payload.get("cover_data") or {}).get("cover") or {})
-    if isinstance(cover, dict):
-        url = first_url(cover.get("url_list"))
-        if url:
-            return url
+    cover_data = payload.get("cover_data") or {}
+    if isinstance(cover_data, dict):
+        for key in ("pc_card_cover", "dynamic_cover", "origin_cover", "cover"):
+            cover = cover_data.get(key) or {}
+            if isinstance(cover, dict):
+                url = first_url(cover.get("url_list"))
+                if url:
+                    return url
     return str(payload.get("cover_url") or "")
 
 
@@ -90,4 +93,3 @@ async def cache_remote_image(url: str, kind: str, headers: dict[str, str] | None
             return str(target)
         target.write_bytes(response.content)
         return str(target)
-

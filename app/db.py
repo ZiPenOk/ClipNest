@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .assets import cover_url_from_payload, relative_asset_path
-from .config import settings
+from .config import normalize_cookie_header, settings
 
 
 DB_PATH = os.path.join(settings.data_dir, "clipnest.sqlite3")
@@ -30,9 +30,11 @@ DEFAULT_PARSER_SETTINGS: dict[str, Any] = {
     "parser_adapter": settings.parser_adapter,
     "douyin_cookie": settings.douyin_cookie,
     "douyin_user_agent": settings.douyin_user_agent,
+    "tiktok_cookie": settings.tiktok_cookie,
+    "tiktok_user_agent": settings.tiktok_user_agent,
     "douyin_signer_kind": "local_abogus",
 }
-PARSER_ADAPTERS = {"native_douyin", "native_douyin_share"}
+PARSER_ADAPTERS = {"native_douyin", "native_douyin_share", "native_tiktok"}
 PARSE_CACHE_TTL_SECONDS = 10 * 60
 QUALITY_ALIASES = {
     "最高": "best",
@@ -153,14 +155,17 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS author_crawl_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_source_id INTEGER,
                 url TEXT NOT NULL,
+                author_name TEXT NOT NULL DEFAULT '',
                 sec_uid TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'queued',
                 progress REAL NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT '',
                 quality_preference TEXT,
+                sync_mode TEXT NOT NULL DEFAULT 'full',
                 max_items INTEGER NOT NULL DEFAULT 200,
-                max_pages INTEGER NOT NULL DEFAULT 30,
+                max_pages INTEGER NOT NULL DEFAULT 80,
                 delay_ms INTEGER NOT NULL DEFAULT 600,
                 cursor INTEGER NOT NULL DEFAULT 0,
                 pages_scanned INTEGER NOT NULL DEFAULT 0,
@@ -172,6 +177,58 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS author_sync_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL DEFAULT 'douyin',
+                url TEXT NOT NULL DEFAULT '',
+                author_name TEXT NOT NULL DEFAULT '',
+                sec_uid TEXT NOT NULL DEFAULT '',
+                avatar_url TEXT NOT NULL DEFAULT '',
+                avatar_path TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                sync_mode TEXT NOT NULL DEFAULT 'incremental',
+                max_items INTEGER NOT NULL DEFAULT 200,
+                max_pages INTEGER NOT NULL DEFAULT 80,
+                delay_ms INTEGER NOT NULL DEFAULT 600,
+                quality_preference TEXT,
+                include_images INTEGER NOT NULL DEFAULT 0,
+                stop_after_existing_pages INTEGER NOT NULL DEFAULT 2,
+                stop_after_existing_items INTEGER NOT NULL DEFAULT 36,
+                last_cursor INTEGER NOT NULL DEFAULT 0,
+                last_seen_video_id TEXT NOT NULL DEFAULT '',
+                last_seen_publish_time INTEGER NOT NULL DEFAULT 0,
+                last_sync_job_id INTEGER,
+                last_sync_status TEXT NOT NULL DEFAULT '',
+                last_sync_message TEXT NOT NULL DEFAULT '',
+                last_sync_at TEXT,
+                last_finished_at TEXT,
+                last_found_count INTEGER NOT NULL DEFAULT 0,
+                last_created_count INTEGER NOT NULL DEFAULT 0,
+                last_reused_count INTEGER NOT NULL DEFAULT 0,
+                last_deleted_skipped_count INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deleted_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL DEFAULT '',
+                video_id TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL DEFAULT '',
+                author_name TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                source_job_id INTEGER,
+                reason TEXT NOT NULL DEFAULT 'manual',
+                deleted_at TEXT NOT NULL
             )
             """
         )
@@ -187,12 +244,24 @@ def init_db() -> None:
         ensure_column(conn, "jobs", "cover_path", "TEXT")
         ensure_column(conn, "jobs", "author_avatar_url", "TEXT")
         ensure_column(conn, "jobs", "author_avatar_path", "TEXT")
+        ensure_column(conn, "author_crawl_jobs", "sync_source_id", "INTEGER")
+        ensure_column(conn, "author_crawl_jobs", "author_name", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "author_crawl_jobs", "sync_mode", "TEXT NOT NULL DEFAULT 'full'")
+        ensure_column(conn, "author_crawl_jobs", "stop_reason", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "author_crawl_jobs", "has_more", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "author_sync_sources", "include_images", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_author ON jobs(author_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_next_attempt ON jobs(status, next_attempt_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_parse_cache_expires ON parse_cache(expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_author_crawl_status ON author_crawl_jobs(status, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_author_crawl_source ON author_crawl_jobs(sync_source_id, id)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_author_sync_source_identity ON author_sync_sources(platform, sec_uid) WHERE sec_uid != ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_author_sync_source_enabled ON author_sync_sources(enabled, platform, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_author_sync_source_author ON author_sync_sources(author_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_media_identity ON deleted_media(platform, video_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_media_url ON deleted_media(url)")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -245,6 +314,42 @@ def author_sec_uid(metadata: dict[str, Any] | None) -> str:
     author = metadata.get("author")
     if isinstance(author, dict):
         return str(author.get("sec_uid") or author.get("sec_user_id") or "")
+    return ""
+
+
+def author_sec_uid_from_history(
+    conn: sqlite3.Connection,
+    author_name: str,
+    preferred_metadata: dict[str, Any] | None = None,
+    platform: str | None = None,
+) -> str:
+    sec_uid = author_sec_uid(preferred_metadata)
+    if sec_uid:
+        return sec_uid
+    clauses = ["COALESCE(author_name, 'Unknown') = ?", "metadata_json IS NOT NULL"]
+    params: list[Any] = [author_name]
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(clean_platform)
+    rows = conn.execute(
+        f"""
+        SELECT metadata_json
+        FROM jobs
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id DESC
+        LIMIT 30
+        """,
+        params,
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        sec_uid = author_sec_uid(metadata)
+        if sec_uid:
+            return sec_uid
     return ""
 
 
@@ -371,10 +476,15 @@ def normalize_parser_settings(values: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Unsupported parser adapter: {adapter}")
         normalized["parser_adapter"] = adapter
     if "douyin_cookie" in values:
-        normalized["douyin_cookie"] = str(values["douyin_cookie"] or "").strip()[:20000]
+        normalized["douyin_cookie"] = normalize_cookie_header(values["douyin_cookie"])[:20000]
     if "douyin_user_agent" in values:
         douyin_user_agent = str(values["douyin_user_agent"] or "").strip()
         normalized["douyin_user_agent"] = (douyin_user_agent or settings.douyin_user_agent)[:500]
+    if "tiktok_cookie" in values:
+        normalized["tiktok_cookie"] = normalize_cookie_header(values["tiktok_cookie"])[:20000]
+    if "tiktok_user_agent" in values:
+        tiktok_user_agent = str(values["tiktok_user_agent"] or "").strip()
+        normalized["tiktok_user_agent"] = (tiktok_user_agent or settings.tiktok_user_agent)[:500]
     return normalized
 
 
@@ -403,6 +513,7 @@ def get_public_app_settings() -> dict[str, Any]:
 def get_parser_settings(include_secret: bool = False) -> dict[str, Any]:
     result = dict(DEFAULT_PARSER_SETTINGS)
     stored_cookie = ""
+    stored_tiktok_cookie = ""
     try:
         with connect() as conn:
             rows = conn.execute("SELECT key, value_json FROM app_settings").fetchall()
@@ -418,6 +529,8 @@ def get_parser_settings(include_secret: bool = False) -> dict[str, Any]:
         result[row["key"]] = value
         if row["key"] == "douyin_cookie":
             stored_cookie = str(value or "")
+        if row["key"] == "tiktok_cookie":
+            stored_tiktok_cookie = str(value or "")
     if result.get("parser_adapter") not in PARSER_ADAPTERS:
         result["parser_adapter"] = settings.parser_adapter
     result["douyin_signer_kind"] = "local_abogus"
@@ -426,6 +539,10 @@ def get_parser_settings(include_secret: bool = False) -> dict[str, Any]:
         result["douyin_cookie"] = ""
         result["douyin_cookie_configured"] = bool(configured_cookie)
         result["douyin_cookie_source"] = "database" if stored_cookie else ("environment" if settings.douyin_cookie else "none")
+        configured_tiktok_cookie = str(result.get("tiktok_cookie") or "")
+        result["tiktok_cookie"] = ""
+        result["tiktok_cookie_configured"] = bool(configured_tiktok_cookie)
+        result["tiktok_cookie_source"] = "database" if stored_tiktok_cookie else ("environment" if settings.tiktok_cookie else "none")
     return result
 
 
@@ -616,33 +733,527 @@ def author_crawl_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     data = dict(row)
     data["quality_preference"] = normalize_quality_preference(data.get("quality_preference"))
+    data["has_more"] = bool(data.get("has_more"))
     return data
+
+
+def author_name_for_sec_uid(conn: sqlite3.Connection, sec_uid: str) -> str:
+    sec_uid = str(sec_uid or "").strip()
+    if not sec_uid:
+        return ""
+    rows = conn.execute(
+        """
+        SELECT author_name, metadata_json
+        FROM jobs
+        WHERE COALESCE(metadata_json, '') LIKE ?
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        (f"%{sec_uid}%",),
+    ).fetchall()
+    for row in rows:
+        author_name = str(row["author_name"] or "").strip()
+        if author_name:
+            return author_name
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        author_name = author_name_from_metadata(metadata)
+        if author_name:
+            return author_name
+    return ""
+
+
+def attach_author_crawl_names(conn: sqlite3.Connection, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for job in jobs:
+        if str(job.get("author_name") or "").strip():
+            continue
+        author_name = author_name_for_sec_uid(conn, str(job.get("sec_uid") or ""))
+        if author_name:
+            job["author_name"] = author_name
+    return jobs
+
+
+def latest_author_crawl_for(
+    conn: sqlite3.Connection,
+    author_name: str,
+    sec_uid: str = "",
+) -> dict[str, Any]:
+    clauses = ["author_name = ?"]
+    params: list[Any] = [author_name]
+    if sec_uid:
+        clauses.append("sec_uid = ?")
+        params.append(sec_uid)
+    row = conn.execute(
+        f"""
+        SELECT id, status, found_count, created_count, reused_count,
+               pages_scanned, created_at, updated_at, finished_at
+        FROM author_crawl_jobs
+        WHERE {' OR '.join(clauses)}
+        ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, id DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def normalize_author_crawl_mode(value: str | None) -> str:
+    return "incremental" if str(value or "").strip().lower() in {"incremental", "inc"} else "full"
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def normalize_sync_source_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    data = dict(row)
+    data["enabled"] = bool(data.get("enabled"))
+    data["include_images"] = bool(data.get("include_images"))
+    data["quality_preference"] = normalize_quality_preference(data.get("quality_preference"))
+    raw_avatar_path = str(data.get("avatar_path") or "")
+    data["avatar_path"] = relative_asset_path(raw_avatar_path)
+    if raw_avatar_path and not data["avatar_path"] and not Path(raw_avatar_path).is_absolute():
+        data["avatar_path"] = raw_avatar_path.replace("\\", "/").lstrip("/")
+    return data
+
+
+def sync_source_payload(values: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = existing or {}
+    mode = normalize_author_crawl_mode(values.get("sync_mode", source.get("sync_mode") or "incremental"))
+    platform = str(values.get("platform", source.get("platform") or "douyin") or "douyin").strip().lower()
+    if platform not in {"douyin", "tiktok"}:
+        platform = "douyin"
+    return {
+        "platform": platform,
+        "url": str(values.get("url", source.get("url") or "") or "").strip(),
+        "author_name": str(values.get("author_name", source.get("author_name") or "") or "").strip()[:120],
+        "sec_uid": str(values.get("sec_uid", source.get("sec_uid") or "") or "").strip(),
+        "avatar_url": str(values.get("avatar_url", source.get("avatar_url") or "") or "").strip()[:2000],
+        "avatar_path": str(values.get("avatar_path", source.get("avatar_path") or "") or "").strip()[:1000],
+        "enabled": 1 if bool(values.get("enabled", source.get("enabled", True))) else 0,
+        "sync_mode": mode,
+        "max_items": _clamp_int(values.get("max_items", source.get("max_items") or 200), 200, 1, 1000),
+        "max_pages": _clamp_int(values.get("max_pages", source.get("max_pages") or 80), 80, 1, 100),
+        "delay_ms": _clamp_int(values.get("delay_ms", source.get("delay_ms") or 600), 600, 0, 5000),
+        "quality_preference": normalize_quality_preference(values.get("quality_preference", source.get("quality_preference"))),
+        "include_images": 1 if bool(values.get("include_images", source.get("include_images", False))) else 0,
+        "stop_after_existing_pages": _clamp_int(
+            values.get("stop_after_existing_pages", source.get("stop_after_existing_pages") or 2),
+            2,
+            1,
+            20,
+        ),
+        "stop_after_existing_items": _clamp_int(
+            values.get("stop_after_existing_items", source.get("stop_after_existing_items") or 36),
+            36,
+            1,
+            300,
+        ),
+        "notes": str(values.get("notes", source.get("notes") or "") or "").strip()[:500],
+    }
+
+
+def get_author_sync_source(source_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM author_sync_sources WHERE id = ?", (int(source_id),)).fetchone()
+    return normalize_sync_source_row(row)
+
+
+def find_author_sync_source(
+    platform: str | None = None,
+    sec_uid: str | None = None,
+    author_name: str | None = None,
+    url: str | None = None,
+) -> dict[str, Any] | None:
+    clean_platform = str(platform or "douyin").strip().lower() or "douyin"
+    clean_sec_uid = str(sec_uid or "").strip()
+    clean_author = str(author_name or "").strip()
+    clean_url = str(url or "").strip()
+    clauses: list[str] = ["platform = ?"]
+    params: list[Any] = [clean_platform]
+    identity_clauses: list[str] = []
+    if clean_sec_uid:
+        identity_clauses.append("sec_uid = ?")
+        params.append(clean_sec_uid)
+    if clean_author:
+        identity_clauses.append("author_name = ?")
+        params.append(clean_author)
+    if clean_url:
+        identity_clauses.append("url = ?")
+        params.append(clean_url)
+    if not identity_clauses:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT * FROM author_sync_sources
+            WHERE {' AND '.join(clauses)} AND ({' OR '.join(identity_clauses)})
+            ORDER BY
+                CASE WHEN sec_uid != '' THEN 0 ELSE 1 END,
+                updated_at DESC,
+                id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    return normalize_sync_source_row(row)
+
+
+def upsert_author_sync_source(values: dict[str, Any]) -> dict[str, Any]:
+    existing = None
+    explicit_id = values.get("id")
+    if explicit_id:
+        existing = get_author_sync_source(int(explicit_id))
+    if not existing:
+        existing = find_author_sync_source(
+            values.get("platform"),
+            values.get("sec_uid"),
+            values.get("author_name"),
+            values.get("url"),
+        )
+    payload = sync_source_payload(values, existing)
+    if not payload["url"] and payload["sec_uid"]:
+        payload["url"] = f"https://www.douyin.com/user/{payload['sec_uid']}"
+    if not payload["url"]:
+        raise ValueError("同步源需要作者主页链接或主页 ID")
+    if not payload["author_name"] and payload["sec_uid"]:
+        payload["author_name"] = payload["sec_uid"]
+    now = utc_now()
+    with connect() as conn:
+        if existing:
+            conn.execute(
+                """
+                UPDATE author_sync_sources
+                SET platform = ?, url = ?, author_name = ?, sec_uid = ?, avatar_url = ?, avatar_path = ?,
+                    enabled = ?, sync_mode = ?, max_items = ?, max_pages = ?, delay_ms = ?,
+                    quality_preference = ?, include_images = ?, stop_after_existing_pages = ?, stop_after_existing_items = ?,
+                    notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    payload["platform"],
+                    payload["url"],
+                    payload["author_name"],
+                    payload["sec_uid"],
+                    payload["avatar_url"],
+                    payload["avatar_path"],
+                    payload["enabled"],
+                    payload["sync_mode"],
+                    payload["max_items"],
+                    payload["max_pages"],
+                    payload["delay_ms"],
+                    payload["quality_preference"],
+                    payload["include_images"],
+                    payload["stop_after_existing_pages"],
+                    payload["stop_after_existing_items"],
+                    payload["notes"],
+                    now,
+                    int(existing["id"]),
+                ),
+            )
+            source_id = int(existing["id"])
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO author_sync_sources (
+                    platform, url, author_name, sec_uid, avatar_url, avatar_path, enabled, sync_mode,
+                    max_items, max_pages, delay_ms, quality_preference, include_images, stop_after_existing_pages,
+                    stop_after_existing_items, notes, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["platform"],
+                    payload["url"],
+                    payload["author_name"],
+                    payload["sec_uid"],
+                    payload["avatar_url"],
+                    payload["avatar_path"],
+                    payload["enabled"],
+                    payload["sync_mode"],
+                    payload["max_items"],
+                    payload["max_pages"],
+                    payload["delay_ms"],
+                    payload["quality_preference"],
+                    payload["include_images"],
+                    payload["stop_after_existing_pages"],
+                    payload["stop_after_existing_items"],
+                    payload["notes"],
+                    now,
+                    now,
+                ),
+            )
+            source_id = int(cur.lastrowid)
+        row = conn.execute("SELECT * FROM author_sync_sources WHERE id = ?", (source_id,)).fetchone()
+    return normalize_sync_source_row(row) or {}
+
+
+def update_author_sync_source(source_id: int, values: dict[str, Any]) -> dict[str, Any]:
+    existing = get_author_sync_source(source_id)
+    if not existing:
+        raise KeyError("Author sync source not found")
+    return upsert_author_sync_source({**values, "id": source_id})
+
+
+def delete_author_sync_source(source_id: int) -> bool:
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM author_sync_sources WHERE id = ?", (int(source_id),))
+        return cur.rowcount > 0
+
+
+def list_author_sync_sources(
+    page: int = 1,
+    page_size: int = 24,
+    q: str | None = None,
+    platform: str | None = None,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    page_size = max(1, min(100, int(page_size or 24)))
+    clauses: list[str] = []
+    params: list[Any] = []
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("platform = ?")
+        params.append(clean_platform)
+    if enabled is not None:
+        clauses.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    if q:
+        like = f"%{q}%"
+        clauses.append("(author_name LIKE ? OR sec_uid LIKE ? OR url LIKE ? OR notes LIKE ?)")
+        params.extend([like, like, like, like])
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    offset = (page - 1) * page_size
+    with connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM author_sync_sources {where}", params).fetchone()[0]
+        stat_where_clauses: list[str] = []
+        stat_params: list[Any] = []
+        if clean_platform:
+            stat_where_clauses.append("platform = ?")
+            stat_params.append(clean_platform)
+        stat_where = f"WHERE {' AND '.join(stat_where_clauses)}" if stat_where_clauses else ""
+        stats_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
+                   SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END) AS disabled,
+                   SUM(CASE WHEN COALESCE(sec_uid, '') = '' THEN 1 ELSE 0 END) AS missing_identity
+            FROM author_sync_sources
+            {stat_where}
+            """,
+            stat_params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM author_sync_sources
+            {where}
+            ORDER BY enabled DESC, COALESCE(last_sync_at, updated_at, created_at) DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, offset),
+        ).fetchall()
+        sources = [normalize_sync_source_row(row) or {} for row in rows]
+        enrich_author_sync_sources(conn, sources)
+    return {
+        "items": sources,
+        "page": page,
+        "page_size": page_size,
+        "total": total or 0,
+        "total_pages": max(1, (int(total or 0) + page_size - 1) // page_size),
+        "stats": {
+            "total": int(stats_row["total"] or 0) if stats_row else 0,
+            "enabled": int(stats_row["enabled"] or 0) if stats_row else 0,
+            "disabled": int(stats_row["disabled"] or 0) if stats_row else 0,
+            "missing_identity": int(stats_row["missing_identity"] or 0) if stats_row else 0,
+        },
+    }
+
+
+def enrich_author_sync_sources(conn: sqlite3.Connection, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for source in sources:
+        platform = str(source.get("platform") or "").strip().lower()
+        author_name = str(source.get("author_name") or "").strip()
+        sec_uid = str(source.get("sec_uid") or "").strip()
+        source_url = str(source.get("url") or "").strip()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if platform:
+            clauses.append("COALESCE(platform, '') = ?")
+            params.append(platform)
+        identity_clauses: list[str] = []
+        if author_name:
+            identity_clauses.append("COALESCE(author_name, '') = ?")
+            params.append(author_name)
+        if sec_uid:
+            identity_clauses.append("COALESCE(metadata_json, '') LIKE ?")
+            params.append(f"%{sec_uid}%")
+        if source_url:
+            identity_clauses.append("url = ?")
+            params.append(source_url)
+        if not identity_clauses:
+            source["media_total"] = 0
+            source["media_finished"] = 0
+            source["media_failed"] = 0
+            source["media_bytes"] = 0
+            source["latest_finished_at"] = ""
+            source["latest_created_at"] = ""
+            continue
+        if identity_clauses:
+            clauses.append(f"({' OR '.join(identity_clauses)})")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        stats = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'finished' THEN 1 ELSE 0 END) AS finished,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status = 'finished' THEN COALESCE(size_bytes, 0) ELSE 0 END) AS bytes,
+                   MAX(finished_at) AS latest_finished_at,
+                   MAX(created_at) AS latest_created_at
+            FROM jobs
+            {where}
+            """,
+            params,
+        ).fetchone()
+        source["media_total"] = int(stats["total"] or 0) if stats else 0
+        source["media_finished"] = int(stats["finished"] or 0) if stats else 0
+        source["media_failed"] = int(stats["failed"] or 0) if stats else 0
+        source["media_bytes"] = int(stats["bytes"] or 0) if stats else 0
+        source["latest_finished_at"] = stats["latest_finished_at"] if stats else ""
+        source["latest_created_at"] = stats["latest_created_at"] if stats else ""
+        crawl_clauses: list[str] = []
+        crawl_params: list[Any] = []
+        if source.get("id"):
+            crawl_clauses.append("sync_source_id = ?")
+            crawl_params.append(int(source["id"]))
+        if sec_uid:
+            crawl_clauses.append("sec_uid = ?")
+            crawl_params.append(sec_uid)
+        if author_name:
+            crawl_clauses.append("author_name = ?")
+            crawl_params.append(author_name)
+        if crawl_clauses:
+            latest_crawl = conn.execute(
+                f"""
+                SELECT stop_reason, has_more
+                FROM author_crawl_jobs
+                WHERE {' OR '.join(crawl_clauses)}
+                ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                crawl_params,
+            ).fetchone()
+            source["last_stop_reason"] = latest_crawl["stop_reason"] if latest_crawl else ""
+            source["last_has_more"] = bool(latest_crawl["has_more"]) if latest_crawl else False
+        if not source.get("avatar_url") or not source.get("avatar_path"):
+            latest = conn.execute(
+                f"""
+                SELECT metadata_json, author_avatar_url, author_avatar_path
+                FROM jobs
+                {where}
+                ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            metadata: dict[str, Any] = {}
+            if latest and latest["metadata_json"]:
+                try:
+                    metadata = json.loads(latest["metadata_json"])
+                except json.JSONDecodeError:
+                    metadata = {}
+            source["avatar_url"] = source.get("avatar_url") or (latest["author_avatar_url"] if latest else "") or author_avatar_url(metadata)
+            source["avatar_path"] = source.get("avatar_path") or relative_asset_path(latest["author_avatar_path"] if latest else "")
+    return sources
+
+
+def import_author_sync_sources_from_library(platform: str | None = "douyin", limit: int = 2000) -> dict[str, Any]:
+    authors = list_authors(limit=limit, platform=platform)
+    created = 0
+    updated = 0
+    skipped = 0
+    items: list[dict[str, Any]] = []
+    for author in authors:
+        sec_uid = str(author.get("sec_uid") or "").strip()
+        if not sec_uid:
+            skipped += 1
+            continue
+        before = find_author_sync_source(platform=platform, sec_uid=sec_uid, author_name=author.get("author"))
+        payload = {
+            "platform": platform or "douyin",
+            "url": f"https://www.douyin.com/user/{sec_uid}",
+            "author_name": author.get("author") or "",
+            "sec_uid": sec_uid,
+            "avatar_url": author.get("avatar_url") or "",
+            "avatar_path": author.get("avatar_path") or "",
+        }
+        if not before:
+            payload.update(
+                {
+                    "enabled": True,
+                    "sync_mode": "incremental",
+                    "max_items": 200,
+                    "max_pages": 80,
+                    "delay_ms": 600,
+                    "include_images": False,
+                }
+            )
+        source = upsert_author_sync_source(payload)
+        if before:
+            updated += 1
+        else:
+            created += 1
+        items.append(source)
+    return {"created": created, "updated": updated, "skipped": skipped, "items": items}
 
 
 def create_author_crawl_job(
     url: str,
     max_items: int = 200,
-    max_pages: int = 30,
+    max_pages: int = 80,
     delay_ms: int = 600,
     quality_preference: str | None = None,
+    author_name: str | None = None,
+    sec_uid: str | None = None,
+    cursor: int = 0,
+    sync_mode: str | None = None,
+    sync_source_id: int | None = None,
 ) -> dict[str, Any]:
     quality = normalize_quality_preference(quality_preference)
+    mode = normalize_author_crawl_mode(sync_mode)
     now = utc_now()
+    clean_author_name = str(author_name or "").strip()[:120]
+    clean_sec_uid = str(sec_uid or "").strip()
+    clean_cursor = max(0, int(cursor or 0))
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO author_crawl_jobs (
-                url, status, progress, message, quality_preference,
-                max_items, max_pages, delay_ms, created_at, updated_at
+                sync_source_id, url, author_name, sec_uid, status, progress, message, quality_preference, sync_mode,
+                max_items, max_pages, delay_ms, cursor, stop_reason, has_more, created_at, updated_at
             )
-            VALUES (?, 'queued', 0, '排队中', ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'queued', 0, '排队中', ?, ?, ?, ?, ?, ?, '', 0, ?, ?)
             """,
             (
+                int(sync_source_id) if sync_source_id else None,
                 url.strip(),
+                clean_author_name,
+                clean_sec_uid,
                 quality,
+                mode,
                 max(1, min(1000, int(max_items or 200))),
-                max(1, min(100, int(max_pages or 30))),
+                max(1, min(100, int(max_pages or 80))),
                 max(0, min(5000, int(delay_ms or 0))),
+                clean_cursor,
                 now,
                 now,
             ),
@@ -654,7 +1265,10 @@ def create_author_crawl_job(
 def get_author_crawl_job(crawl_id: int) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM author_crawl_jobs WHERE id = ?", (crawl_id,)).fetchone()
-    return author_crawl_row_to_dict(row)
+        job = author_crawl_row_to_dict(row)
+        if job:
+            attach_author_crawl_names(conn, [job])
+    return job
 
 
 def list_author_crawl_jobs(limit: int = 20) -> list[dict[str, Any]]:
@@ -674,7 +1288,66 @@ def list_author_crawl_jobs(limit: int = 20) -> list[dict[str, Any]]:
             """,
             (max(1, min(100, int(limit or 20))),),
         ).fetchall()
-    return [author_crawl_row_to_dict(row) or {} for row in rows]
+        jobs = [author_crawl_row_to_dict(row) or {} for row in rows]
+        attach_author_crawl_names(conn, jobs)
+    return jobs
+
+
+def list_author_crawl_history_for_source(source_id: int, limit: int = 30) -> list[dict[str, Any]]:
+    source = get_author_sync_source(source_id)
+    if not source:
+        raise KeyError("Author sync source not found")
+    clauses = ["sync_source_id = ?"]
+    params: list[Any] = [int(source_id)]
+    sec_uid = str(source.get("sec_uid") or "").strip()
+    author_name = str(source.get("author_name") or "").strip()
+    url = str(source.get("url") or "").strip()
+    if sec_uid:
+        clauses.append("sec_uid = ?")
+        params.append(sec_uid)
+    if author_name:
+        clauses.append("author_name = ?")
+        params.append(author_name)
+    if url:
+        clauses.append("url = ?")
+        params.append(url)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM author_crawl_jobs
+            WHERE {' OR '.join(clauses)}
+            ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (*params, max(1, min(100, int(limit or 30)))),
+        ).fetchall()
+        jobs = [author_crawl_row_to_dict(row) or {} for row in rows]
+        attach_author_crawl_names(conn, jobs)
+    return jobs
+
+
+def author_sync_source_detail(source_id: int, history_limit: int = 30) -> dict[str, Any]:
+    source = get_author_sync_source(source_id)
+    if not source:
+        raise KeyError("Author sync source not found")
+    history = list_author_crawl_history_for_source(source_id, limit=history_limit)
+    finished = [job for job in history if str(job.get("status") or "") == "finished"]
+    failed = [job for job in history if str(job.get("status") or "") == "failed"]
+    latest = history[0] if history else {}
+    return {
+        "source": source,
+        "history": history,
+        "summary": {
+            "history_count": len(history),
+            "finished_count": len(finished),
+            "failed_count": len(failed),
+            "latest_status": latest.get("status") or source.get("last_sync_status") or "",
+            "latest_message": latest.get("message") or source.get("last_sync_message") or "",
+            "latest_stop_reason": latest.get("stop_reason") or "",
+            "latest_has_more": bool(latest.get("has_more")),
+        },
+    }
 
 
 def update_author_crawl_job(crawl_id: int, **fields: Any) -> None:
@@ -686,6 +1359,49 @@ def update_author_crawl_job(crawl_id: int, **fields: Any) -> None:
     values.append(crawl_id)
     with connect() as conn:
         conn.execute(f"UPDATE author_crawl_jobs SET {columns} WHERE id = ?", values)
+
+
+def cleanup_author_crawl_jobs(statuses: list[str], limit: int = 500) -> dict[str, Any]:
+    clean_statuses = [str(status or "").strip().lower() for status in statuses if str(status or "").strip()]
+    allowed = {"finished", "failed", "cancelled"}
+    clean_statuses = [status for status in clean_statuses if status in allowed]
+    if not clean_statuses:
+        return {"deleted": [], "skipped": []}
+    placeholders = ", ".join("?" for _ in clean_statuses)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, status
+            FROM author_crawl_jobs
+            WHERE status IN ({placeholders})
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*clean_statuses, max(1, min(2000, int(limit or 500)))),
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if ids:
+            id_placeholders = ", ".join("?" for _ in ids)
+            conn.execute(f"DELETE FROM author_crawl_jobs WHERE id IN ({id_placeholders})", ids)
+    return {"deleted": ids, "skipped": []}
+
+
+def active_author_crawl_for_source(source_id: int) -> dict[str, Any] | None:
+    if not source_id:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM author_crawl_jobs
+            WHERE sync_source_id = ?
+              AND status IN ('queued', 'running', 'pausing', 'paused')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(source_id),),
+        ).fetchone()
+    return author_crawl_row_to_dict(row)
 
 
 def claim_next_author_crawl_job() -> dict[str, Any] | None:
@@ -725,11 +1441,166 @@ def author_crawl_status(crawl_id: int) -> str:
     return str(row["status"] if row else "")
 
 
+def update_author_sync_source_from_crawl(
+    crawl_id: int,
+    last_seen_video_id: str = "",
+    last_seen_publish_time: int = 0,
+    deleted_skipped_count: int = 0,
+) -> None:
+    with connect() as conn:
+        crawl = conn.execute("SELECT * FROM author_crawl_jobs WHERE id = ?", (int(crawl_id),)).fetchone()
+        if not crawl:
+            return
+        source_id = crawl["sync_source_id"]
+        source: sqlite3.Row | None = None
+        if source_id:
+            source = conn.execute("SELECT * FROM author_sync_sources WHERE id = ?", (source_id,)).fetchone()
+        if not source:
+            found = find_author_sync_source(
+                platform="douyin",
+                sec_uid=crawl["sec_uid"],
+                author_name=crawl["author_name"],
+                url=crawl["url"],
+            )
+            if found:
+                source_id = int(found["id"])
+        if not source_id:
+            return
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE author_sync_sources
+            SET url = CASE WHEN ? != '' THEN ? ELSE url END,
+                author_name = CASE WHEN ? != '' THEN ? ELSE author_name END,
+                sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
+                last_cursor = ?,
+                last_seen_video_id = CASE WHEN ? != '' THEN ? ELSE last_seen_video_id END,
+                last_seen_publish_time = CASE WHEN ? > 0 THEN ? ELSE last_seen_publish_time END,
+                last_sync_job_id = ?,
+                last_sync_status = ?,
+                last_sync_message = ?,
+                last_sync_at = ?,
+                last_finished_at = CASE WHEN ? IS NOT NULL THEN ? ELSE last_finished_at END,
+                last_found_count = ?,
+                last_created_count = ?,
+                last_reused_count = ?,
+                last_deleted_skipped_count = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                str(crawl["url"] or ""),
+                str(crawl["url"] or ""),
+                str(crawl["author_name"] or ""),
+                str(crawl["author_name"] or ""),
+                str(crawl["sec_uid"] or ""),
+                str(crawl["sec_uid"] or ""),
+                int(crawl["cursor"] or 0),
+                last_seen_video_id,
+                last_seen_video_id,
+                int(last_seen_publish_time or 0),
+                int(last_seen_publish_time or 0),
+                int(crawl_id),
+                str(crawl["status"] or ""),
+                str(crawl["message"] or ""),
+                now,
+                crawl["finished_at"],
+                crawl["finished_at"],
+                int(crawl["found_count"] or 0),
+                int(crawl["created_count"] or 0),
+                int(crawl["reused_count"] or 0),
+                int(deleted_skipped_count or 0),
+                now,
+                int(source_id),
+            ),
+        )
+
+
 def delete_job(job_id: int) -> bool:
     with connect() as conn:
         conn.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
         cur = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         return cur.rowcount > 0
+
+
+def mark_deleted_media(job: dict[str, Any], reason: str = "manual") -> None:
+    if not job:
+        return
+    metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    metadata_fields = metadata_job_fields(metadata)
+    platform = str(job.get("platform") or metadata_fields.get("platform") or "").strip() or "douyin"
+    video_id = str(job.get("video_id") or metadata_fields.get("video_id") or "").strip()
+    url = str(job.get("url") or "").strip()
+    if not platform and not video_id and not url:
+        return
+    author_name = str(job.get("author_name") or metadata_fields.get("author_name") or "").strip()
+    title = str(job.get("title") or job.get("description") or metadata_fields.get("title") or "").strip()
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO deleted_media (
+                platform, video_id, url, author_name, title, source_job_id, reason, deleted_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                platform,
+                video_id,
+                url,
+                author_name,
+                title,
+                int(job.get("id") or 0) or None,
+                str(reason or "manual")[:40],
+                now,
+            ),
+        )
+
+
+def is_deleted_media(platform: str | None = None, video_id: str | None = None, url: str | None = None) -> bool:
+    clean_platform = str(platform or "").strip()
+    clean_video_id = str(video_id or "").strip()
+    clean_url = str(url or "").strip()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if clean_video_id:
+        if clean_platform:
+            clauses.append("(video_id = ? AND (platform = ? OR platform = ''))")
+            params.extend([clean_video_id, clean_platform])
+        else:
+            clauses.append("video_id = ?")
+            params.append(clean_video_id)
+    if clean_url:
+        clauses.append("url = ?")
+        params.append(clean_url)
+    if not clauses:
+        return False
+    with connect() as conn:
+        row = conn.execute(
+            f"SELECT 1 FROM deleted_media WHERE {' OR '.join(clauses)} LIMIT 1",
+            params,
+        ).fetchone()
+    return row is not None
+
+
+def list_author_jobs(author: str, platform: str | None = None) -> list[dict[str, Any]]:
+    author = str(author or "Unknown")
+    clauses = ["COALESCE(author_name, 'Unknown') = ?"]
+    params: list[Any] = [author]
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(clean_platform)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id ASC
+            """,
+            params,
+        ).fetchall()
+    return [row_to_dict(row) or {} for row in rows]
 
 
 def get_job(job_id: int) -> dict[str, Any] | None:
@@ -743,6 +1614,7 @@ def list_jobs(
     status: str | None = None,
     author: str | None = None,
     q: str | None = None,
+    platform: str | None = None,
 ) -> list[dict[str, Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -755,6 +1627,9 @@ def list_jobs(
     if author:
         clauses.append("COALESCE(author_name, 'Unknown') = ?")
         params.append(author)
+    if platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(str(platform).strip().lower())
     if q:
         like = f"%{q}%"
         clauses.append(
@@ -782,6 +1657,7 @@ def job_filter_clauses(
     status: str | None = None,
     author: str | None = None,
     q: str | None = None,
+    platform: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -794,6 +1670,9 @@ def job_filter_clauses(
     if author:
         clauses.append("COALESCE(author_name, 'Unknown') = ?")
         params.append(author)
+    if platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(platform)
     if q:
         like = f"%{q}%"
         clauses.append(
@@ -817,10 +1696,11 @@ def list_jobs_page(
     status: str | None = None,
     author: str | None = None,
     q: str | None = None,
+    platform: str | None = None,
 ) -> dict[str, Any]:
     page = max(1, int(page or 1))
     page_size = max(1, min(100, int(page_size or 50)))
-    clauses, params = job_filter_clauses(status=status, author=author, q=q)
+    clauses, params = job_filter_clauses(status=status, author=author, q=q, platform=platform)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     offset = (page - 1) * page_size
     with connect() as conn:
@@ -865,13 +1745,27 @@ def find_existing_video_job(
     platform: str,
     video_id: str,
     quality_preference: str | None = None,
+    match_quality: bool = True,
 ) -> dict[str, Any] | None:
     platform = str(platform or "").strip()
     video_id = str(video_id or "").strip()
     if not platform or not video_id:
         return None
-    quality = normalize_quality_preference(quality_preference)
     with connect() as conn:
+        if not match_quality:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE platform = ?
+                  AND video_id = ?
+                  AND status NOT IN ('failed', 'cancelled')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (platform, video_id),
+            ).fetchone()
+            return row_to_dict(row)
+        quality = normalize_quality_preference(quality_preference)
         row = conn.execute(
             """
             SELECT * FROM jobs
@@ -972,31 +1866,118 @@ def list_events(job_id: int) -> list[dict[str, Any]]:
     return events
 
 
+def normalize_event_row(row: sqlite3.Row) -> dict[str, Any]:
+    event = dict(row)
+    if event.get("data_json"):
+        try:
+            event["data"] = json.loads(event["data_json"])
+        except json.JSONDecodeError:
+            event["data"] = {}
+    else:
+        event["data"] = {}
+    event.pop("data_json", None)
+    return event
+
+
 def list_recent_events(limit: int = 100) -> list[dict[str, Any]]:
-    with connect() as conn:
-        rows = conn.execute(
+    return list_events_page(page=1, page_size=max(1, min(500, int(limit)))).get("items", [])
+
+
+def list_events_page(
+    page: int = 1,
+    page_size: int = 30,
+    q: str | None = None,
+    event_type: str | None = None,
+    platform: str | None = None,
+    status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    page_size = max(1, min(100, int(page_size or 30)))
+    clauses: list[str] = []
+    params: list[Any] = []
+    clean_event_type = str(event_type or "").strip()
+    if clean_event_type:
+        clauses.append("job_events.event_type = ?")
+        params.append(clean_event_type)
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("COALESCE(jobs.platform, '') = ?")
+        params.append(clean_platform)
+    clean_status = str(status or "").strip().lower()
+    if clean_status:
+        clauses.append("COALESCE(jobs.status, '') = ?")
+        params.append(clean_status)
+    if q:
+        like = f"%{q}%"
+        clauses.append(
             """
-            SELECT job_events.*, jobs.title, jobs.author_name, jobs.status AS job_status
+            (
+                job_events.message LIKE ? OR
+                job_events.event_type LIKE ? OR
+                COALESCE(jobs.title, '') LIKE ? OR
+                COALESCE(jobs.description, '') LIKE ? OR
+                COALESCE(jobs.author_name, '') LIKE ? OR
+                COALESCE(jobs.url, '') LIKE ? OR
+                COALESCE(jobs.video_id, '') LIKE ?
+            )
+            """
+        )
+        params.extend([like, like, like, like, like, like, like])
+    if date_from:
+        clauses.append("job_events.created_at >= ?")
+        params.append(day_start(date_from))
+    if date_to:
+        clauses.append("job_events.created_at <= ?")
+        params.append(day_end(date_to))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    offset = (page - 1) * page_size
+    with connect() as conn:
+        total = conn.execute(
+            f"""
+            SELECT COUNT(*)
             FROM job_events
             LEFT JOIN jobs ON jobs.id = job_events.job_id
-            ORDER BY job_events.id DESC
-            LIMIT ?
+            {where}
             """,
-            (max(1, min(500, int(limit))),),
+            params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT job_events.*,
+                   jobs.title,
+                   jobs.description,
+                   jobs.author_name,
+                   jobs.platform,
+                   jobs.status AS job_status,
+                   jobs.video_id,
+                   jobs.url
+            FROM job_events
+            LEFT JOIN jobs ON jobs.id = job_events.job_id
+            {where}
+            ORDER BY job_events.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, offset),
         ).fetchall()
-    events: list[dict[str, Any]] = []
-    for row in rows:
-        event = dict(row)
-        if event.get("data_json"):
-            try:
-                event["data"] = json.loads(event["data_json"])
-            except json.JSONDecodeError:
-                event["data"] = {}
-        else:
-            event["data"] = {}
-        event.pop("data_json", None)
-        events.append(event)
-    return events
+        type_rows = conn.execute(
+            """
+            SELECT event_type, COUNT(*) AS count
+            FROM job_events
+            GROUP BY event_type
+            ORDER BY count DESC, event_type ASC
+            LIMIT 50
+            """
+        ).fetchall()
+    return {
+        "items": [normalize_event_row(row) for row in rows],
+        "page": page,
+        "page_size": page_size,
+        "total": total or 0,
+        "total_pages": max(1, (int(total or 0) + page_size - 1) // page_size),
+        "event_types": [dict(row) for row in type_rows],
+    }
 
 
 def checkpoint() -> None:
@@ -1019,6 +2000,49 @@ def get_stats() -> dict[str, Any]:
             FROM jobs
             """
         ).fetchone()
+        platform_rows = conn.execute(
+            """
+            SELECT COALESCE(platform, 'unknown') AS platform,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'finished' THEN 1 ELSE 0 END) AS finished,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(COALESCE(size_bytes, 0)) AS bytes
+            FROM jobs
+            GROUP BY COALESCE(platform, 'unknown')
+            ORDER BY finished DESC, total DESC
+            """
+        ).fetchall()
+        media_rows = conn.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN status = 'finished' AND ({media_type_clause("image")}) THEN 1 ELSE 0 END) AS images,
+                SUM(CASE WHEN status = 'finished' AND NOT ({media_type_clause("image")}) THEN 1 ELSE 0 END) AS videos
+            FROM jobs
+            """
+        ).fetchone()
+        chart_rows = conn.execute(
+            """
+            SELECT substr(COALESCE(finished_at, created_at), 1, 10) AS day,
+                   SUM(CASE WHEN status = 'finished' THEN 1 ELSE 0 END) AS finished,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status = 'finished' THEN COALESCE(size_bytes, 0) ELSE 0 END) AS bytes
+            FROM jobs
+            WHERE COALESCE(finished_at, created_at) >= datetime('now', '-13 days')
+            GROUP BY day
+            ORDER BY day ASC
+            """
+        ).fetchall()
+        recent_rows = conn.execute(
+            """
+            SELECT id, title, description, author_name, platform, status, size_bytes, resolution,
+                   created_at, finished_at, error
+            FROM jobs
+            WHERE status IN ('finished', 'failed')
+            ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+        deleted_count = conn.execute("SELECT COUNT(*) FROM deleted_media").fetchone()[0]
         authors = conn.execute(
             """
             SELECT COALESCE(author_name, 'Unknown') AS author,
@@ -1039,14 +2063,136 @@ def get_stats() -> dict[str, Any]:
         "running": totals["running"] or 0,
         "cancelled": totals["cancelled"] or 0,
         "bytes": totals["bytes"] or 0,
+        "deleted": deleted_count or 0,
+        "platforms": [dict(row) for row in platform_rows],
+        "media": {
+            "videos": media_rows["videos"] or 0,
+            "images": media_rows["images"] or 0,
+        },
+        "chart": [dict(row) for row in chart_rows],
+        "recent": [dict(row) for row in recent_rows],
         "authors": [dict(row) for row in authors],
     }
 
 
-def list_authors(limit: int = 100) -> list[dict[str, Any]]:
+def list_deleted_media(
+    page: int = 1,
+    page_size: int = 30,
+    q: str | None = None,
+    platform: str | None = None,
+    author: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    page_size = max(1, min(100, int(page_size or 30)))
+    clauses: list[str] = []
+    params: list[Any] = []
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("platform = ?")
+        params.append(clean_platform)
+    clean_author = str(author or "").strip()
+    if clean_author:
+        clauses.append("author_name = ?")
+        params.append(clean_author)
+    if date_from:
+        clauses.append("deleted_at >= ?")
+        params.append(day_start(date_from))
+    if date_to:
+        clauses.append("deleted_at <= ?")
+        params.append(day_end(date_to))
+    if q:
+        like = f"%{q}%"
+        clauses.append(
+            """
+            (
+                COALESCE(title, '') LIKE ? OR
+                COALESCE(author_name, '') LIKE ? OR
+                COALESCE(video_id, '') LIKE ? OR
+                COALESCE(url, '') LIKE ?
+            )
+            """
+        )
+        params.extend([like, like, like, like])
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    offset = (page - 1) * page_size
+    with connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM deleted_media {where}", params).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM deleted_media
+            {where}
+            ORDER BY deleted_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, offset),
+        ).fetchall()
+    return {
+        "items": [dict(row) for row in rows],
+        "page": page,
+        "page_size": page_size,
+        "total": total or 0,
+        "total_pages": max(1, (int(total or 0) + page_size - 1) // page_size),
+    }
+
+
+def delete_deleted_media_record(record_id: int) -> bool:
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM deleted_media WHERE id = ?", (int(record_id),))
+        return cur.rowcount > 0
+
+
+def clear_deleted_media_records(
+    platform: str | None = None,
+    author_name: str | None = None,
+    q: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> int:
+    clauses: list[str] = []
+    params: list[Any] = []
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("platform = ?")
+        params.append(clean_platform)
+    clean_author = str(author_name or "").strip()
+    if clean_author:
+        clauses.append("author_name = ?")
+        params.append(clean_author)
+    if date_from:
+        clauses.append("deleted_at >= ?")
+        params.append(day_start(date_from))
+    if date_to:
+        clauses.append("deleted_at <= ?")
+        params.append(day_end(date_to))
+    if q:
+        like = f"%{q}%"
+        clauses.append(
+            """
+            (
+                COALESCE(title, '') LIKE ? OR
+                COALESCE(author_name, '') LIKE ? OR
+                COALESCE(video_id, '') LIKE ? OR
+                COALESCE(url, '') LIKE ?
+            )
+            """
+        )
+        params.extend([like, like, like, like])
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect() as conn:
+        cur = conn.execute(f"DELETE FROM deleted_media {where}", params)
+        return cur.rowcount
+
+
+def list_authors(limit: int = 100, platform: str | None = None) -> list[dict[str, Any]]:
+    clean_platform = str(platform or "").strip().lower()
+    where = "WHERE COALESCE(platform, '') = ?" if clean_platform else ""
+    params: list[Any] = [clean_platform] if clean_platform else []
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT COALESCE(author_name, 'Unknown') AS author,
                    COUNT(*) AS total,
                    SUM(CASE WHEN status = 'finished' THEN 1 ELSE 0 END) AS finished,
@@ -1055,48 +2201,39 @@ def list_authors(limit: int = 100) -> list[dict[str, Any]]:
                    MAX(created_at) AS latest_created_at,
                    MAX(finished_at) AS latest_finished_at
             FROM jobs
+            {where}
             GROUP BY COALESCE(author_name, 'Unknown')
             ORDER BY finished DESC, total DESC, bytes DESC
             LIMIT ?
             """,
-            (max(1, min(500, int(limit))),),
+            (*params, max(1, min(500, int(limit)))),
         ).fetchall()
         authors = [dict(row) for row in rows]
-        for author in authors:
-            latest = conn.execute(
-                """
-                SELECT metadata_json, cover_url, cover_path, author_avatar_url, author_avatar_path
-                FROM jobs
-                WHERE COALESCE(author_name, 'Unknown') = ?
-                ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
-                LIMIT 1
-                """,
-                (author["author"],),
-            ).fetchone()
-            metadata: dict[str, Any] = {}
-            if latest and latest["metadata_json"]:
-                try:
-                    metadata = json.loads(latest["metadata_json"])
-                except json.JSONDecodeError:
-                    metadata = {}
-            author["avatar_url"] = (latest["author_avatar_url"] if latest else "") or author_avatar_url(metadata)
-            author["avatar_path"] = relative_asset_path(latest["author_avatar_path"] if latest else "")
-            author["cover_url"] = latest["cover_url"] if latest else ""
-            author["cover_path"] = relative_asset_path(latest["cover_path"] if latest else "")
+        attach_author_assets(conn, authors, platform=clean_platform or None)
     return authors
 
 
-def attach_author_assets(conn: sqlite3.Connection, authors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def attach_author_assets(
+    conn: sqlite3.Connection,
+    authors: list[dict[str, Any]],
+    platform: str | None = None,
+) -> list[dict[str, Any]]:
+    clean_platform = str(platform or "").strip().lower()
     for author in authors:
+        clauses = ["COALESCE(author_name, 'Unknown') = ?"]
+        params: list[Any] = [author["author"]]
+        if clean_platform:
+            clauses.append("COALESCE(platform, '') = ?")
+            params.append(clean_platform)
         latest = conn.execute(
-            """
+            f"""
             SELECT metadata_json, cover_url, cover_path, author_avatar_url, author_avatar_path
             FROM jobs
-            WHERE COALESCE(author_name, 'Unknown') = ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
             LIMIT 1
             """,
-            (author["author"],),
+            params,
         ).fetchone()
         metadata: dict[str, Any] = {}
         if latest and latest["metadata_json"]:
@@ -1108,14 +2245,30 @@ def attach_author_assets(conn: sqlite3.Connection, authors: list[dict[str, Any]]
         author["avatar_path"] = relative_asset_path(latest["author_avatar_path"] if latest else "")
         author["cover_url"] = latest["cover_url"] if latest else ""
         author["cover_path"] = relative_asset_path(latest["cover_path"] if latest else "")
+        author["sec_uid"] = author_sec_uid_from_history(conn, author["author"], metadata, platform=clean_platform or None)
+        sync = latest_author_crawl_for(conn, author["author"], author["sec_uid"]) if clean_platform in {"", "douyin"} else {}
+        author["last_sync_at"] = sync.get("finished_at") or sync.get("updated_at") or sync.get("created_at") or ""
+        author["last_sync_status"] = sync.get("status") or ""
+        author["last_sync_created_count"] = sync.get("created_count") or 0
+        author["last_sync_reused_count"] = sync.get("reused_count") or 0
+        author["last_sync_found_count"] = sync.get("found_count") or 0
     return authors
 
 
-def list_authors_page(page: int = 1, page_size: int = 24, q: str | None = None) -> dict[str, Any]:
+def list_authors_page(
+    page: int = 1,
+    page_size: int = 24,
+    q: str | None = None,
+    platform: str | None = None,
+) -> dict[str, Any]:
     page = max(1, int(page or 1))
     page_size = max(1, min(100, int(page_size or 24)))
     clauses: list[str] = []
     params: list[Any] = []
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(clean_platform)
     if q:
         clauses.append("COALESCE(author_name, 'Unknown') LIKE ?")
         params.append(f"%{q}%")
@@ -1150,7 +2303,7 @@ def list_authors_page(page: int = 1, page_size: int = 24, q: str | None = None) 
             """,
             (*params, page_size, offset),
         ).fetchall()
-        items = attach_author_assets(conn, [dict(row) for row in rows])
+        items = attach_author_assets(conn, [dict(row) for row in rows], platform=clean_platform or None)
     return {
         "items": items,
         "page": page,
@@ -1198,6 +2351,12 @@ def library_identity_sql(alias: str = "jobs") -> str:
 
 
 def library_sort_sql(sort: str | None) -> str:
+    if sort == "publish_desc":
+        return """
+            CAST(COALESCE(json_extract(metadata_json, '$.create_time'), 0) AS INTEGER) DESC,
+            COALESCE(finished_at, created_at) DESC,
+            id DESC
+        """
     if sort == "oldest":
         return "COALESCE(finished_at, created_at) ASC, id ASC"
     if sort == "size_desc":
@@ -1209,6 +2368,30 @@ def library_sort_sql(sort: str | None) -> str:
     return "COALESCE(finished_at, created_at) DESC, id DESC"
 
 
+def day_start(value: str | None) -> str:
+    text = str(value or "").strip()
+    return f"{text}T00:00:00" if text and "T" not in text else text
+
+
+def day_end(value: str | None) -> str:
+    text = str(value or "").strip()
+    return f"{text}T23:59:59" if text and "T" not in text else text
+
+
+def library_publish_time_value(item: dict[str, Any]) -> int:
+    metadata = item.get("metadata") if isinstance(item, dict) else {}
+    if not isinstance(metadata, dict):
+        return 0
+    try:
+        return int(metadata.get("create_time") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def library_fallback_time_value(item: dict[str, Any]) -> str:
+    return str(item.get("finished_at") or item.get("created_at") or "")
+
+
 def list_library_jobs_page(
     page: int = 1,
     page_size: int = 30,
@@ -1216,11 +2399,29 @@ def list_library_jobs_page(
     media_type: str | None = None,
     q: str | None = None,
     sort: str | None = None,
+    platform: str | None = None,
+    status: str | None = None,
+    date_field: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> dict[str, Any]:
     page = max(1, int(page or 1))
     page_size = max(1, min(100, int(page_size or 30)))
-    clauses = ["status = 'finished'"]
-    params: list[Any] = []
+    clean_status = str(status or "finished").strip().lower()
+    valid_statuses = {"finished", "failed", "cancelled", "queued", "retry", "parsing", "downloading", "cancelling", "active", "all"}
+    if clean_status not in valid_statuses:
+        clean_status = "finished"
+    if clean_status == "all":
+        clauses: list[str] = []
+    elif clean_status == "active":
+        clauses = ["status IN ('queued', 'retry', 'parsing', 'downloading', 'cancelling')"]
+    else:
+        clauses = ["status = ?"]
+    params: list[Any] = [] if clean_status in {"all", "active"} else [clean_status]
+    clean_platform = str(platform or "").strip().lower()
+    if clean_platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(clean_platform)
     if author:
         clauses.append("COALESCE(author_name, 'Unknown') = ?")
         params.append(author)
@@ -1241,7 +2442,20 @@ def list_library_jobs_page(
             """
         )
         params.extend([like, like, like, like, like])
-    where = f"WHERE {' AND '.join(clauses)}"
+    field = str(date_field or "download").strip().lower()
+    if field == "publish":
+        date_expr = "datetime(CAST(COALESCE(json_extract(metadata_json, '$.create_time'), 0) AS INTEGER), 'unixepoch')"
+    elif field == "created":
+        date_expr = "created_at"
+    else:
+        date_expr = "COALESCE(finished_at, updated_at, created_at)"
+    if date_from:
+        clauses.append(f"{date_expr} >= ?")
+        params.append(day_start(date_from))
+    if date_to:
+        clauses.append(f"{date_expr} <= ?")
+        params.append(day_end(date_to))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     offset = (page - 1) * page_size
     identity_sql = library_identity_sql()
     with connect() as conn:
@@ -1280,9 +2494,16 @@ def list_library_jobs_page(
     }
 
 
-def author_detail(author: str) -> dict[str, Any]:
+def author_detail(author: str, platform: str | None = None) -> dict[str, Any]:
     author = str(author or "Unknown")
     image_clause = media_type_clause("image")
+    clean_platform = str(platform or "").strip().lower()
+    clauses = ["COALESCE(author_name, 'Unknown') = ?"]
+    params: list[Any] = [author]
+    if clean_platform:
+        clauses.append("COALESCE(platform, '') = ?")
+        params.append(clean_platform)
+    where = f"WHERE {' AND '.join(clauses)}"
     with connect() as conn:
         totals = conn.execute(
             f"""
@@ -1296,23 +2517,23 @@ def author_detail(author: str) -> dict[str, Any]:
                 MAX(created_at) AS latest_created_at,
                 MAX(finished_at) AS latest_finished_at
             FROM jobs
-            WHERE COALESCE(author_name, 'Unknown') = ?
+            {where}
             """,
-            (author,),
+            params,
         ).fetchone()
         item = dict(totals) if totals else {}
         item["author"] = author
-        attach_author_assets(conn, [item])
+        attach_author_assets(conn, [item], platform=clean_platform or None)
         latest = conn.execute(
-            """
+            f"""
             SELECT metadata_json
             FROM jobs
-            WHERE COALESCE(author_name, 'Unknown') = ?
+            {where}
               AND metadata_json IS NOT NULL
             ORDER BY id DESC
             LIMIT 1
             """,
-            (author,),
+            params,
         ).fetchone()
         metadata: dict[str, Any] = {}
         if latest and latest["metadata_json"]:
@@ -1320,7 +2541,12 @@ def author_detail(author: str) -> dict[str, Any]:
                 metadata = json.loads(latest["metadata_json"])
             except json.JSONDecodeError:
                 metadata = {}
-        item["sec_uid"] = author_sec_uid(metadata)
+        item["sec_uid"] = author_sec_uid_from_history(conn, author, metadata, platform=clean_platform or None)
+        item["sync_source"] = find_author_sync_source(
+            platform=clean_platform or "douyin",
+            sec_uid=item.get("sec_uid") or "",
+            author_name=author,
+        )
     return item
 
 

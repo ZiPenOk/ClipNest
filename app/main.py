@@ -2,10 +2,12 @@ from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import html
+import math
 from pathlib import Path
 import re
 import time
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import Body, Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
@@ -18,7 +20,7 @@ from .assets import ASSET_ROOT, author_avatar_url_from_payload, cache_remote_ima
 from .config import settings
 from .downloader import build_download_headers, ordered_bit_rate_candidates, relative_media_path
 from .notifier import send_telegram
-from .parser import NativeDouyinParserAdapter, ParserClient, author_name_from_payload
+from .parser import NativeDouyinParserAdapter, NativeTikTokParserAdapter, ParserClient, author_name_from_payload
 from .telegram_bot import TelegramBotWorker
 from .worker import AuthorCrawlWorker, DownloadWorker
 
@@ -46,16 +48,73 @@ class PushCreate(BaseModel):
     urls: list[str] = Field(default_factory=list)
     text: str | None = None
     quality_preference: str | None = Field(default=None, max_length=20)
+    cover_url: str | None = Field(default=None, max_length=3000)
     dry_run: bool = False
 
 
 class AuthorCrawlCreate(BaseModel):
     url: str = Field(min_length=8)
+    author_name: str | None = Field(default=None, max_length=120)
+    sec_uid: str | None = Field(default=None, max_length=220)
+    sync_source_id: int | None = None
     max_items: int = Field(default=200, ge=1, le=1000)
-    max_pages: int = Field(default=30, ge=1, le=100)
+    max_pages: int = Field(default=80, ge=1, le=100)
     delay_ms: int = Field(default=600, ge=0, le=5000)
     quality_preference: str | None = Field(default=None, max_length=20)
+    sync_mode: str | None = Field(default=None, max_length=20)
     dry_run: bool = False
+
+
+class AuthorSyncSourceCreate(BaseModel):
+    url: str | None = Field(default=None, max_length=2000)
+    author_name: str | None = Field(default=None, max_length=120)
+    sec_uid: str | None = Field(default=None, max_length=220)
+    platform: str | None = Field(default="douyin", max_length=40)
+    enabled: bool = True
+    sync_mode: str | None = Field(default="incremental", max_length=20)
+    max_items: int = Field(default=200, ge=1, le=1000)
+    max_pages: int = Field(default=80, ge=1, le=100)
+    delay_ms: int = Field(default=600, ge=0, le=5000)
+    quality_preference: str | None = Field(default=None, max_length=20)
+    include_images: bool = False
+    stop_after_existing_pages: int = Field(default=2, ge=1, le=20)
+    stop_after_existing_items: int = Field(default=36, ge=1, le=300)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class AuthorSyncSourceUpdate(BaseModel):
+    url: str | None = Field(default=None, max_length=2000)
+    author_name: str | None = Field(default=None, max_length=120)
+    sec_uid: str | None = Field(default=None, max_length=220)
+    platform: str | None = Field(default=None, max_length=40)
+    enabled: bool | None = None
+    sync_mode: str | None = Field(default=None, max_length=20)
+    max_items: int | None = Field(default=None, ge=1, le=1000)
+    max_pages: int | None = Field(default=None, ge=1, le=100)
+    delay_ms: int | None = Field(default=None, ge=0, le=5000)
+    quality_preference: str | None = Field(default=None, max_length=20)
+    include_images: bool | None = None
+    stop_after_existing_pages: int | None = Field(default=None, ge=1, le=20)
+    stop_after_existing_items: int | None = Field(default=None, ge=1, le=300)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class AuthorSyncBatchCrawl(BaseModel):
+    source_ids: list[int] = Field(default_factory=list, max_length=2000)
+    sync_mode: str | None = Field(default=None, max_length=20)
+    enabled_only: bool = True
+
+
+class AuthorSyncBatchUpdate(BaseModel):
+    source_ids: list[int] = Field(default_factory=list, max_length=500)
+    enabled: bool | None = None
+    sync_mode: str | None = Field(default=None, max_length=20)
+    max_items: int | None = Field(default=None, ge=1, le=1000)
+    max_pages: int | None = Field(default=None, ge=1, le=100)
+    include_images: bool | None = None
+    stop_after_existing_pages: int | None = Field(default=None, ge=1, le=20)
+    stop_after_existing_items: int | None = Field(default=None, ge=1, le=300)
+    delete: bool = False
 
 
 class ParsePreviewCreate(BaseModel):
@@ -102,6 +161,8 @@ class ParserSettingsUpdate(BaseModel):
     parser_adapter: str | None = None
     douyin_cookie: str | None = Field(default=None, max_length=20000)
     douyin_user_agent: str | None = Field(default=None, max_length=500)
+    tiktok_cookie: str | None = Field(default=None, max_length=20000)
+    tiktok_user_agent: str | None = Field(default=None, max_length=500)
 
 
 RUNNING_STATUSES = {"parsing", "downloading", "cancelling"}
@@ -160,6 +221,45 @@ def clean_url(value: str) -> str:
     return value.strip().rstrip(TRAILING_URL_PUNCTUATION)
 
 
+def diagnose_error_text(error: str | None, platform: str | None = None) -> dict:
+    raw = str(error or "").strip()
+    lower = raw.lower()
+    clean_platform = str(platform or "").strip().lower()
+    if not raw:
+        return {"code": "", "message": "", "suggestion": ""}
+    if "cookie" in lower or "login" in lower or "captcha" in lower:
+        return {
+            "code": "cookie_or_login",
+            "message": f"{clean_platform or '平台'} Cookie 可能失效或需要重新登录",
+            "suggestion": "更新 Cookie 后重试，必要时重新打开浏览器获取完整 Cookie。",
+        }
+    if "403" in lower or "forbidden" in lower:
+        return {
+            "code": "http_403",
+            "message": "平台拒绝访问链接",
+            "suggestion": "更新 Cookie、确认网络/地区可访问，稍后重试。",
+        }
+    if "404" in lower or "not found" in lower:
+        return {
+            "code": "http_404",
+            "message": "作品可能已删除、私密或链接无效",
+            "suggestion": "检查原链接是否能在浏览器直接打开。",
+        }
+    if "timeout" in lower or "timed out" in lower:
+        return {
+            "code": "timeout",
+            "message": "网络请求超时",
+            "suggestion": "检查网络、DNS、代理或稍后重试。",
+        }
+    if clean_platform == "tiktok" and any(key in lower for key in ("region", "signature", "aweme", "web json", "rehydration")):
+        return {
+            "code": "tiktok_region_or_signature",
+            "message": "TikTok 解析受地区、登录态或页面结构影响",
+            "suggestion": "确认服务器可访问 TikTok，补充 TikTok Cookie 后重试。",
+        }
+    return {"code": "unknown", "message": raw.splitlines()[0][:300], "suggestion": "查看任务详情里的原始错误。"}
+
+
 def collect_urls(payload: JobBatchCreate) -> list[str]:
     candidates = list(payload.urls)
     if payload.text:
@@ -186,11 +286,49 @@ def create_push_jobs(urls: list[str], quality_preference: str | None = None) -> 
     return [db.create_job_or_reuse_finished(url, quality_preference=quality_preference) for url in urls]
 
 
+def clean_cover_url(value: str | None) -> str:
+    raw = html.unescape(str(value or "").strip())
+    if not raw.startswith(("http://", "https://")):
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host == "douyinpic.com" or host.endswith(".douyinpic.com"):
+        return raw
+    return ""
+
+
+async def attach_pushed_cover(job: dict, cover_url: str | None) -> bool:
+    clean = clean_cover_url(cover_url)
+    job_id = int(job.get("id") or 0)
+    if not clean or not job_id:
+        return False
+    headers = {
+        "User-Agent": settings.douyin_user_agent or "Mozilla/5.0 ClipNest/0.1",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": "https://www.douyin.com/",
+    }
+    try:
+        cover_path = await cache_remote_image(clean, "covers", headers=headers)
+    except Exception as exc:
+        db.add_event(job_id, "push:cover_failed", f"Push cover cache failed: {exc}", {"cover_url": clean})
+        return False
+    db.update_job(job_id, cover_url=clean, cover_path=cover_path, preview_path=cover_path)
+    db.add_event(job_id, "push:cover", "Using cover from browser push", {"cover_url": clean})
+    job["cover_url"] = clean
+    job["cover_path"] = cover_path
+    job["preview_path"] = cover_path
+    return True
+
+
 def push_summary(
     *,
     urls: list[str],
     jobs: list[dict] | None = None,
     dry_run: bool = False,
+    cover_attached: bool = False,
 ) -> dict:
     jobs = jobs or []
     reused_count = sum(1 for item in jobs if item.get("reused"))
@@ -208,6 +346,7 @@ def push_summary(
         "count": len(urls) if dry_run else len(jobs),
         "created_count": created_count,
         "reused_count": reused_count,
+        "cover_attached": cover_attached,
         "message": message,
     }
 
@@ -237,11 +376,7 @@ def remove_job_files(job_data: dict) -> list[str]:
 
 
 def first_cover_url(payload: dict) -> str:
-    cover = ((payload.get("cover_data") or {}).get("cover") or {})
-    urls = cover.get("url_list") if isinstance(cover, dict) else None
-    if urls and isinstance(urls, list):
-        return str(urls[0] or "")
-    return str(payload.get("cover_url") or "")
+    return cover_url_from_payload(payload)
 
 
 def format_quality_option(item: dict) -> dict:
@@ -339,6 +474,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
+if TOOLS_DIR.exists():
+    app.mount("/tools", StaticFiles(directory=str(TOOLS_DIR)), name="tools")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -442,6 +580,45 @@ async def parser_health():
     return await ParserClient().health()
 
 
+@app.get("/api/tiktok/diagnostics", dependencies=[Depends(require_token)])
+async def tiktok_diagnostics(limit: int = Query(default=10, ge=1, le=50)):
+    parser_settings = db.get_parser_settings(include_secret=False)
+    adapter = NativeTikTokParserAdapter(parser_settings=db.get_parser_settings(include_secret=True))
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, url, status, error, error_type, message, updated_at, created_at
+            FROM jobs
+            WHERE COALESCE(platform, '') = 'tiktok'
+              AND status IN ('failed', 'retry')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    failures = []
+    for row in rows:
+        item = dict(row)
+        item["diagnosis"] = diagnose_error_text(item.get("error") or item.get("message"), "tiktok")
+        failures.append(item)
+    health_info = await adapter.health()
+    cookie_configured = bool(parser_settings.get("tiktok_cookie_configured"))
+    suggestions = []
+    if not cookie_configured:
+        suggestions.append("建议配置 TikTok Cookie，部分地区或登录态视频需要 Cookie 才能解析。")
+    if failures:
+        suggestions.append("最近有 TikTok 失败任务，可以先从失败任务重试或查看详情。")
+    return {
+        "ok": True,
+        "platform": "tiktok",
+        "cookie_configured": cookie_configured,
+        "cookie_source": parser_settings.get("tiktok_cookie_source"),
+        "adapter": health_info,
+        "recent_failures": failures,
+        "suggestions": suggestions,
+    }
+
+
 @app.post("/api/parse-preview", dependencies=[Depends(require_token)])
 async def parse_preview(payload: ParsePreviewCreate):
     url = clean_url(payload.url)
@@ -507,7 +684,10 @@ async def push_jobs(payload: PushCreate):
         created = create_push_jobs(urls, quality_preference=payload.quality_preference)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {**push_summary(urls=urls, jobs=created), "jobs": created}
+    cover_attached = False
+    if len(urls) == 1 and created:
+        cover_attached = await attach_pushed_cover(created[0], payload.cover_url)
+    return {**push_summary(urls=urls, jobs=created, cover_attached=cover_attached), "jobs": created}
 
 
 @app.get("/api/push", response_class=HTMLResponse, dependencies=[Depends(require_token)])
@@ -515,9 +695,10 @@ async def push_job_from_query(
     url: str | None = Query(default=None),
     text: str | None = Query(default=None),
     quality_preference: str | None = Query(default=None, max_length=20),
+    cover_url: str | None = Query(default=None, max_length=3000),
     dry_run: bool = Query(default=False),
 ):
-    payload = PushCreate(url=url, text=text, quality_preference=quality_preference, dry_run=dry_run)
+    payload = PushCreate(url=url, text=text, quality_preference=quality_preference, cover_url=cover_url, dry_run=dry_run)
     urls = collect_urls(push_payload_to_batch(payload))
     if not urls:
         raise HTTPException(status_code=400, detail="No valid video links found")
@@ -529,7 +710,10 @@ async def push_job_from_query(
             created = create_push_jobs(urls, quality_preference=quality_preference)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    summary = push_summary(urls=urls, jobs=created, dry_run=dry_run)
+    cover_attached = False
+    if not dry_run and len(urls) == 1 and created:
+        cover_attached = await attach_pushed_cover(created[0], cover_url)
+    summary = push_summary(urls=urls, jobs=created, dry_run=dry_run, cover_attached=cover_attached)
     title = "ClipNest 推送预检完成" if dry_run else "ClipNest 推送完成"
     body = "".join(f"<li>{html.escape(item)}</li>" for item in urls[:20])
     extra = (
@@ -559,19 +743,251 @@ async def create_author_crawl(payload: AuthorCrawlCreate):
         quality = db.normalize_quality_preference(payload.quality_preference)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    source = db.get_author_sync_source(payload.sync_source_id) if payload.sync_source_id else None
+    url = clean_url(payload.url)
+    author_name = payload.author_name
+    sec_uid = payload.sec_uid
+    sync_source_id = payload.sync_source_id
+    if source:
+        url = str(source.get("url") or url)
+        author_name = author_name or str(source.get("author_name") or "")
+        sec_uid = sec_uid or str(source.get("sec_uid") or "")
+        sync_source_id = int(source["id"])
     job = db.create_author_crawl_job(
-        clean_url(payload.url),
+        url,
         max_items=payload.max_items,
         max_pages=payload.max_pages,
         delay_ms=payload.delay_ms,
         quality_preference=quality,
+        author_name=author_name,
+        sec_uid=sec_uid,
+        sync_mode=payload.sync_mode,
+        sync_source_id=sync_source_id,
     )
-    return {"message": "作者抓取任务已创建", "job": job}
+    return {"message": "作者抓取任务已创建", "job": job, "source": source}
 
 
 @app.get("/api/author-crawls", dependencies=[Depends(require_token)])
 async def list_author_crawls(limit: int = Query(default=20, ge=1, le=100)):
     return db.list_author_crawl_jobs(limit=limit)
+
+
+@app.post("/api/author-crawls/cleanup", dependencies=[Depends(require_token)])
+async def cleanup_author_crawls(
+    status: str = Query(default="finished,failed,cancelled", max_length=120),
+    limit: int = Query(default=500, ge=1, le=2000),
+):
+    statuses = [item.strip() for item in status.split(",")]
+    return db.cleanup_author_crawl_jobs(statuses=statuses, limit=limit)
+
+
+async def resolve_author_sync_source_payload(payload: AuthorSyncSourceCreate | AuthorSyncSourceUpdate) -> dict:
+    values = payload.model_dump(exclude_unset=True)
+    url = clean_url(str(values.get("url") or ""))
+    sec_uid = str(values.get("sec_uid") or "").strip()
+    platform = str(values.get("platform") or "douyin").strip().lower() or "douyin"
+    if platform != "douyin":
+        raise HTTPException(status_code=400, detail="当前作者同步只支持抖音")
+    if url and not sec_uid:
+        direct = NativeDouyinParserAdapter.extract_sec_uid(url)
+        if direct and direct.lower() != "self":
+            sec_uid = direct
+        else:
+            parser_settings = db.get_parser_settings(include_secret=True)
+            crawler = NativeDouyinParserAdapter(parser_settings=parser_settings)
+            try:
+                sec_uid = await crawler.resolve_sec_uid(url)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"解析作者主页失败：{exc}") from exc
+    if sec_uid and not url:
+        url = f"https://www.douyin.com/user/{sec_uid}"
+    if not url and not sec_uid:
+        raise HTTPException(status_code=400, detail="请填写作者主页链接或主页 ID")
+    values["platform"] = platform
+    values["url"] = url
+    values["sec_uid"] = sec_uid
+    return values
+
+
+@app.get("/api/author-sync-sources", dependencies=[Depends(require_token)])
+async def list_author_sync_sources(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=24, ge=1, le=100),
+    q: str | None = Query(default=None, max_length=120),
+    platform: str | None = Query(default="douyin", max_length=40),
+    enabled: bool | None = Query(default=None),
+):
+    return db.list_author_sync_sources(
+        page=page,
+        page_size=page_size,
+        q=q.strip() if q else None,
+        platform=platform.strip().lower() if platform else None,
+        enabled=enabled,
+    )
+
+
+@app.get("/api/author-sync-sources/{source_id}", dependencies=[Depends(require_token)])
+async def author_sync_source_detail(
+    source_id: int,
+    history_limit: int = Query(default=30, ge=1, le=100),
+):
+    try:
+        return db.author_sync_source_detail(source_id, history_limit=history_limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Author sync source not found") from exc
+
+
+@app.post("/api/author-sync-sources", dependencies=[Depends(require_token)])
+async def create_author_sync_source(payload: AuthorSyncSourceCreate):
+    values = await resolve_author_sync_source_payload(payload)
+    try:
+        source = db.upsert_author_sync_source(values)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "作者同步源已保存", "source": source}
+
+
+@app.patch("/api/author-sync-sources/{source_id}", dependencies=[Depends(require_token)])
+async def update_author_sync_source(source_id: int, payload: AuthorSyncSourceUpdate):
+    values = await resolve_author_sync_source_payload(payload) if payload.url or payload.sec_uid else payload.model_dump(exclude_unset=True)
+    try:
+        source = db.update_author_sync_source(source_id, values)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Author sync source not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "作者同步源已更新", "source": source}
+
+
+@app.delete("/api/author-sync-sources/{source_id}", dependencies=[Depends(require_token)])
+async def delete_author_sync_source(source_id: int):
+    if not db.delete_author_sync_source(source_id):
+        raise HTTPException(status_code=404, detail="Author sync source not found")
+    return {"deleted": True}
+
+
+@app.post("/api/author-sync-sources/bulk", dependencies=[Depends(require_token)])
+async def bulk_author_sync_sources(payload: AuthorSyncBatchUpdate):
+    if not payload.source_ids:
+        raise HTTPException(status_code=400, detail="No author sync sources selected")
+    updated: list[int] = []
+    deleted: list[int] = []
+    skipped: list[dict] = []
+    for source_id in payload.source_ids:
+        source = db.get_author_sync_source(source_id)
+        if not source:
+            skipped.append({"id": source_id, "reason": "not_found"})
+            continue
+        if payload.delete:
+            if db.delete_author_sync_source(source_id):
+                deleted.append(source_id)
+            continue
+        patch: dict = {}
+        if payload.enabled is not None:
+            patch["enabled"] = payload.enabled
+        if payload.sync_mode is not None:
+            patch["sync_mode"] = payload.sync_mode
+        if payload.max_items is not None:
+            patch["max_items"] = payload.max_items
+            patch["max_pages"] = max(30, min(100, math.ceil(payload.max_items / 18) + 5))
+        if payload.max_pages is not None:
+            patch["max_pages"] = payload.max_pages
+        if payload.include_images is not None:
+            patch["include_images"] = payload.include_images
+        if payload.stop_after_existing_pages is not None:
+            patch["stop_after_existing_pages"] = payload.stop_after_existing_pages
+        if payload.stop_after_existing_items is not None:
+            patch["stop_after_existing_items"] = payload.stop_after_existing_items
+        if not patch:
+            skipped.append({"id": source_id, "reason": "no_change"})
+            continue
+        db.update_author_sync_source(source_id, patch)
+        updated.append(source_id)
+    return {"updated": updated, "deleted": deleted, "skipped": skipped}
+
+
+@app.post("/api/author-sync-sources/import-library", dependencies=[Depends(require_token)])
+async def import_author_sync_sources_from_library(
+    platform: str | None = Query(default="douyin", max_length=40),
+    limit: int = Query(default=2000, ge=1, le=2000),
+):
+    return db.import_author_sync_sources_from_library(platform=platform.strip().lower() if platform else "douyin", limit=limit)
+
+
+def author_sync_source_to_crawl(source: dict, sync_mode: str | None = None) -> dict:
+    mode = db.normalize_author_crawl_mode(sync_mode or source.get("sync_mode") or "incremental")
+    existing = db.active_author_crawl_for_source(int(source["id"]))
+    if existing:
+        existing["reused"] = True
+        return existing
+    job = db.create_author_crawl_job(
+        str(source.get("url") or f"https://www.douyin.com/user/{source.get('sec_uid') or ''}"),
+        max_items=int(source.get("max_items") or 200),
+        max_pages=int(source.get("max_pages") or 80),
+        delay_ms=int(source.get("delay_ms") or 600),
+        quality_preference=source.get("quality_preference"),
+        author_name=str(source.get("author_name") or ""),
+        sec_uid=str(source.get("sec_uid") or ""),
+        sync_mode=mode,
+        sync_source_id=int(source["id"]),
+    )
+    job["reused"] = False
+    return job
+
+
+@app.post("/api/author-sync-sources/{source_id}/crawl", dependencies=[Depends(require_token)])
+async def crawl_author_sync_source(source_id: int, sync_mode: str | None = Query(default=None, max_length=20)):
+    source = db.get_author_sync_source(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Author sync source not found")
+    if not source.get("enabled"):
+        raise HTTPException(status_code=409, detail="该作者同步源已停用")
+    job = author_sync_source_to_crawl(source, sync_mode=sync_mode)
+    return {"message": "同步任务已创建", "job": job, "source": source}
+
+
+@app.post("/api/author-sync-sources/crawl", dependencies=[Depends(require_token)])
+async def crawl_author_sync_sources(payload: AuthorSyncBatchCrawl):
+    if payload.source_ids:
+        sources = []
+        for source_id in payload.source_ids:
+            source = db.get_author_sync_source(source_id)
+            if source:
+                sources.append(source)
+    else:
+        sources = []
+        page_no = 1
+        while True:
+            page = db.list_author_sync_sources(
+                page=page_no,
+                page_size=100,
+                platform="douyin",
+                enabled=True if payload.enabled_only else None,
+            )
+            sources.extend(page.get("items") or [])
+            if page_no >= int(page.get("total_pages") or 1):
+                break
+            page_no += 1
+    created: list[dict] = []
+    reused_count = 0
+    skipped: list[dict] = []
+    for source in sources:
+        if payload.enabled_only and not source.get("enabled"):
+            skipped.append({"id": source.get("id"), "reason": "disabled"})
+            continue
+        if not str(source.get("sec_uid") or "").strip() and not str(source.get("url") or "").strip():
+            skipped.append({"id": source.get("id"), "reason": "missing_identity"})
+            continue
+        job = author_sync_source_to_crawl(source, sync_mode=payload.sync_mode)
+        if job.get("reused"):
+            reused_count += 1
+        created.append(job)
+    new_count = len(created) - reused_count
+    skipped_count = len(skipped)
+    message = f"已创建 {new_count} 个同步任务，复用 {reused_count} 个进行中任务"
+    if skipped_count:
+        message += f"，跳过 {skipped_count} 个不可同步作者"
+    return {"message": message, "jobs": created, "skipped": skipped}
 
 
 @app.post("/api/author-crawls/{crawl_id}/pause", dependencies=[Depends(require_token)])
@@ -606,6 +1022,32 @@ async def resume_author_crawl(crawl_id: int):
         finished_at=None,
     )
     return db.get_author_crawl_job(crawl_id) or {}
+
+
+@app.post("/api/author-crawls/{crawl_id}/continue", dependencies=[Depends(require_token)])
+async def continue_author_crawl(crawl_id: int):
+    found = db.get_author_crawl_job(crawl_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Author crawl job not found")
+    status = str(found.get("status") or "")
+    cursor = int(found.get("cursor") or 0)
+    if status != "finished" or cursor <= 0:
+        raise HTTPException(status_code=409, detail=f"Cannot continue from status: {status}")
+    message = str(found.get("message") or "")
+    if "更多" not in message:
+        raise HTTPException(status_code=409, detail="This author crawl has no more saved pages")
+    job = db.create_author_crawl_job(
+        str(found.get("url") or ""),
+        max_items=int(found.get("max_items") or 200),
+        max_pages=int(found.get("max_pages") or 80),
+        delay_ms=int(found.get("delay_ms") or 600),
+        quality_preference=found.get("quality_preference"),
+        author_name=str(found.get("author_name") or ""),
+        sec_uid=str(found.get("sec_uid") or ""),
+        cursor=cursor,
+        sync_mode=str(found.get("sync_mode") or "full"),
+    )
+    return {"message": "续抓任务已创建", "job": job, "source_id": crawl_id}
 
 
 @app.post("/api/author-crawls/{crawl_id}/cancel", dependencies=[Depends(require_token)])
@@ -651,10 +1093,22 @@ async def crawl_author_posts(payload: AuthorCrawlCreate):
     created: list[dict] = []
     reused: list[dict] = []
     preview: list[dict] = []
+    deleted_skipped: list[dict] = []
     for item in crawl["items"]:
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         platform = str(metadata.get("platform") or "douyin")
         video_id = str(metadata.get("video_id") or item.get("aweme_id") or "")
+        item_url = str(item.get("url") or "")
+        if db.is_deleted_media(platform=platform, video_id=video_id, url=item_url):
+            deleted_skipped.append(
+                {
+                    "url": item.get("url"),
+                    "video_id": video_id,
+                    "title": item.get("desc"),
+                    "author_name": item.get("author_name"),
+                }
+            )
+            continue
         existing = db.find_existing_video_job(platform, video_id, quality_preference=quality)
         if existing:
             reused.append(
@@ -678,15 +1132,22 @@ async def crawl_author_posts(payload: AuthorCrawlCreate):
                 }
             )
             continue
-        created.append(db.create_job(str(item.get("url") or ""), quality_preference=quality, metadata=metadata))
+        created.append(db.create_job(item_url, quality_preference=quality, metadata=metadata))
 
     created_count = len(created)
     reused_count = len(reused)
     would_create_count = len(preview)
+    deleted_skipped_count = len(deleted_skipped)
     if payload.dry_run:
-        message = f"预检完成：发现 {crawl['count']} 个作品，{would_create_count} 个可加入，{reused_count} 个已存在"
+        message = (
+            f"预检完成：发现 {crawl['count']} 个作品，"
+            f"{would_create_count} 个可加入，{reused_count} 个已存在，{deleted_skipped_count} 个已删除跳过"
+        )
     else:
-        message = f"作者作品已加入队列：新增 {created_count} 个，已存在 {reused_count} 个"
+        message = (
+            f"作者作品已加入队列：新增 {created_count} 个，"
+            f"已存在 {reused_count} 个，已删除跳过 {deleted_skipped_count} 个"
+        )
     if crawl.get("limit_reached"):
         message += "，还有更多作品未抓完"
     return {
@@ -697,6 +1158,7 @@ async def crawl_author_posts(payload: AuthorCrawlCreate):
         "created_count": created_count,
         "reused_count": reused_count,
         "would_create_count": would_create_count,
+        "deleted_skipped_count": deleted_skipped_count,
         "pages": crawl.get("pages", 0),
         "has_more": crawl.get("has_more", False),
         "limit_reached": crawl.get("limit_reached", False),
@@ -705,6 +1167,7 @@ async def crawl_author_posts(payload: AuthorCrawlCreate):
         "created": created[:50],
         "reused": reused[:50],
         "preview": preview[:50],
+        "deleted_skipped": deleted_skipped[:50],
     }
 
 
@@ -713,6 +1176,7 @@ async def jobs(
     limit: int = Query(default=100, ge=1, le=500),
     status: str | None = Query(default=None),
     author: str | None = Query(default=None),
+    platform: str | None = Query(default=None, max_length=40),
     q: str | None = Query(default=None, max_length=120),
     page: int | None = Query(default=None, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
@@ -724,6 +1188,7 @@ async def jobs(
                 page_size=page_size,
                 status=status.strip() if status else None,
                 author=author.strip() if author else None,
+                platform=platform.strip().lower() if platform else None,
                 q=q.strip() if q else None,
             )
         )
@@ -732,6 +1197,7 @@ async def jobs(
             limit=limit,
             status=status.strip() if status else None,
             author=author.strip() if author else None,
+            platform=platform.strip().lower() if platform else None,
             q=q.strip() if q else None,
         )
     )
@@ -830,6 +1296,37 @@ async def bulk_delete_jobs(payload: JobBulkAction):
             skipped.append({"id": job_id, "reason": f"status:{found.get('status')}"})
             continue
         if payload.delete_file:
+            files_removed.extend(remove_job_files(found))
+            db.mark_deleted_media(found, reason="bulk")
+        db.delete_job(job_id)
+        deleted.append(job_id)
+    return {"deleted": deleted, "skipped": skipped, "files_removed": files_removed}
+
+
+@app.post("/api/jobs/cleanup", dependencies=[Depends(require_token)])
+async def cleanup_jobs(
+    status: str = Query(min_length=1, max_length=40),
+    platform: str | None = Query(default=None, max_length=40),
+    delete_file: bool = Query(default=False),
+    limit: int = Query(default=500, ge=1, le=2000),
+):
+    clean_status = status.strip().lower()
+    if clean_status not in {"failed", "cancelled"}:
+        raise HTTPException(status_code=400, detail="Only failed/cancelled cleanup is supported")
+    candidates = db.list_jobs(
+        limit=limit,
+        status=clean_status,
+        platform=platform.strip().lower() if platform else None,
+    )
+    deleted: list[int] = []
+    skipped: list[dict] = []
+    files_removed: list[str] = []
+    for found in candidates:
+        job_id = int(found.get("id") or 0)
+        if found.get("status") in RUNNING_STATUSES:
+            skipped.append({"id": job_id, "reason": f"status:{found.get('status')}"})
+            continue
+        if delete_file:
             files_removed.extend(remove_job_files(found))
         db.delete_job(job_id)
         deleted.append(job_id)
@@ -1008,6 +1505,8 @@ async def delete_job(job_id: int, delete_file: bool = Query(default=False)):
     if found.get("status") in RUNNING_STATUSES:
         raise HTTPException(status_code=409, detail="Job is running")
     removed = remove_job_files(found) if delete_file else []
+    if delete_file:
+        db.mark_deleted_media(found, reason="single")
     db.delete_job(job_id)
     return {"deleted": True, "files_removed": removed}
 
@@ -1023,15 +1522,60 @@ async def library_authors(
     page: int | None = Query(default=None, ge=1),
     page_size: int = Query(default=24, ge=1, le=100),
     q: str | None = Query(default=None, max_length=120),
+    platform: str | None = Query(default=None, max_length=40),
 ):
+    clean_platform = platform.strip().lower() if platform else None
     if page is not None:
-        return db.list_authors_page(page=page, page_size=page_size, q=q.strip() if q else None)
-    return db.list_authors(limit)
+        return db.list_authors_page(page=page, page_size=page_size, q=q.strip() if q else None, platform=clean_platform)
+    return db.list_authors(limit, platform=clean_platform)
 
 
 @app.get("/api/library/authors/{author}", dependencies=[Depends(require_token)])
-async def library_author_detail(author: str):
-    return db.author_detail(author)
+async def library_author_detail(author: str, platform: str | None = Query(default=None, max_length=40)):
+    return db.author_detail(author, platform=platform.strip().lower() if platform else None)
+
+
+@app.delete("/api/library/authors/{author}", dependencies=[Depends(require_token)])
+async def delete_library_author(
+    author: str,
+    delete_file: bool = Query(default=True),
+    platform: str | None = Query(default=None, max_length=40),
+):
+    return delete_library_author_jobs(author, delete_file=delete_file, platform=platform.strip().lower() if platform else None)
+
+
+@app.delete("/api/library/author", dependencies=[Depends(require_token)])
+async def delete_library_author_by_query(
+    author: str = Query(min_length=1, max_length=160),
+    delete_file: bool = Query(default=True),
+    platform: str | None = Query(default=None, max_length=40),
+):
+    return delete_library_author_jobs(author, delete_file=delete_file, platform=platform.strip().lower() if platform else None)
+
+
+def delete_library_author_jobs(author: str, delete_file: bool = True, platform: str | None = None):
+    jobs = db.list_author_jobs(author, platform=platform)
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Author not found")
+    deleted: list[int] = []
+    skipped: list[dict] = []
+    files_removed: list[str] = []
+    for found in jobs:
+        job_id = int(found.get("id") or 0)
+        if found.get("status") in RUNNING_STATUSES:
+            skipped.append({"id": job_id, "reason": f"status:{found.get('status')}"})
+            continue
+        if delete_file:
+            files_removed.extend(remove_job_files(found))
+        db.mark_deleted_media(found, reason="author")
+        db.delete_job(job_id)
+        deleted.append(job_id)
+    return {
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+        "skipped": skipped,
+        "files_removed": files_removed,
+    }
 
 
 @app.get("/api/library/jobs", dependencies=[Depends(require_token)])
@@ -1041,19 +1585,76 @@ async def library_jobs(
     page: int | None = Query(default=None, ge=1),
     page_size: int = Query(default=30, ge=1, le=100),
     type: str | None = Query(default=None),
-    sort: str | None = Query(default="newest"),
+    sort: str | None = Query(default="publish_desc"),
     q: str | None = Query(default=None, max_length=120),
+    platform: str | None = Query(default=None, max_length=40),
+    status: str | None = Query(default="finished", max_length=40),
+    date_field: str | None = Query(default="download", max_length=20),
+    date_from: str | None = Query(default=None, max_length=30),
+    date_to: str | None = Query(default=None, max_length=30),
 ):
+    clean_platform = platform.strip().lower() if platform else None
     if page is not None:
         return db.list_library_jobs_page(
             page=page,
             page_size=page_size,
             author=author.strip() if author else None,
             media_type=type.strip() if type else None,
-            sort=sort.strip() if sort else "newest",
+            sort=sort.strip() if sort else "publish_desc",
             q=q.strip() if q else None,
+            platform=clean_platform,
+            status=status.strip() if status else "finished",
+            date_field=date_field.strip() if date_field else "download",
+            date_from=date_from.strip() if date_from else None,
+            date_to=date_to.strip() if date_to else None,
         )
-    return db.list_jobs(limit=limit, author=author.strip() if author else None)
+    return db.list_jobs(limit=limit, author=author.strip() if author else None, platform=clean_platform)
+
+
+@app.get("/api/library/deleted", dependencies=[Depends(require_token)])
+async def deleted_library_media(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100),
+    q: str | None = Query(default=None, max_length=120),
+    platform: str | None = Query(default=None, max_length=40),
+    author: str | None = Query(default=None, max_length=160),
+    date_from: str | None = Query(default=None, max_length=30),
+    date_to: str | None = Query(default=None, max_length=30),
+):
+    return db.list_deleted_media(
+        page=page,
+        page_size=page_size,
+        q=q.strip() if q else None,
+        platform=platform.strip().lower() if platform else None,
+        author=author.strip() if author else None,
+        date_from=date_from.strip() if date_from else None,
+        date_to=date_to.strip() if date_to else None,
+    )
+
+
+@app.delete("/api/library/deleted/{record_id}", dependencies=[Depends(require_token)])
+async def delete_deleted_library_media(record_id: int):
+    if not db.delete_deleted_media_record(record_id):
+        raise HTTPException(status_code=404, detail="Deleted media record not found")
+    return {"deleted": True}
+
+
+@app.delete("/api/library/deleted", dependencies=[Depends(require_token)])
+async def clear_deleted_library_media(
+    platform: str | None = Query(default=None, max_length=40),
+    author: str | None = Query(default=None, max_length=160),
+    q: str | None = Query(default=None, max_length=120),
+    date_from: str | None = Query(default=None, max_length=30),
+    date_to: str | None = Query(default=None, max_length=30),
+):
+    deleted_count = db.clear_deleted_media_records(
+        platform=platform.strip().lower() if platform else None,
+        author_name=author.strip() if author else None,
+        q=q.strip() if q else None,
+        date_from=date_from.strip() if date_from else None,
+        date_to=date_to.strip() if date_to else None,
+    )
+    return {"deleted_count": deleted_count}
 
 
 @app.get("/api/cookie/health", dependencies=[Depends(require_token)])
@@ -1102,6 +1703,29 @@ async def health():
 @app.get("/api/maintenance/events", dependencies=[Depends(require_token)])
 async def maintenance_events(limit: int = Query(default=100, ge=1, le=500)):
     return db.list_recent_events(limit)
+
+
+@app.get("/api/logs/events", dependencies=[Depends(require_token)])
+async def logs_events(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100),
+    q: str | None = Query(default=None, max_length=160),
+    event_type: str | None = Query(default=None, max_length=80),
+    platform: str | None = Query(default=None, max_length=40),
+    status: str | None = Query(default=None, max_length=40),
+    date_from: str | None = Query(default=None, max_length=40),
+    date_to: str | None = Query(default=None, max_length=40),
+):
+    return db.list_events_page(
+        page=page,
+        page_size=page_size,
+        q=q.strip() if q else None,
+        event_type=event_type.strip() if event_type else None,
+        platform=platform.strip().lower() if platform else None,
+        status=status.strip().lower() if status else None,
+        date_from=date_from.strip() if date_from else None,
+        date_to=date_to.strip() if date_to else None,
+    )
 
 
 @app.get("/api/maintenance/config", dependencies=[Depends(require_token)])

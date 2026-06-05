@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClipNest Bold Preview</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #edf3f2;
+        --ink: #141b20;
+        --muted: #67757a;
+        --line: #d9e3e1;
+        --panel: #ffffff;
+        --soft: #f7faf9;
+        --dark: #0b1113;
+        --dark-2: #111a1c;
+        --green: #0f766e;
+        --green-soft: #dff2ee;
+        --coral: #d85f45;
+        --yellow: #d99b27;
+        --blue: #315cc8;
+        --shadow: 0 22px 54px rgba(17, 26, 28, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.45;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        min-height: 38px;
+        border: 1px solid var(--dark);
+        border-radius: 6px;
+        background: var(--dark);
+        color: #fff;
+        padding: 0 14px;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: #fff;
+        color: var(--ink);
+        border-color: var(--line);
+      }
+
+      input,
+      select,
+      textarea {
+        width: 100%;
+        min-height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--ink);
+        padding: 10px 12px;
+      }
+
+      textarea {
+        resize: vertical;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+
+      .top {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        display: grid;
+        grid-template-columns: 220px minmax(0, 1fr) auto;
+        gap: 18px;
+        align-items: center;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        background: var(--dark);
+        color: #fff;
+        padding: 14px 22px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 9px;
+        background:
+          linear-gradient(135deg, rgba(255, 255, 255, 0.18), transparent 44%),
+          #0f766e;
+      }
+
+      .brand strong {
+        font-size: 21px;
+        letter-spacing: 0;
+      }
+
+      .nav {
+        display: flex;
+        justify-content: center;
+        gap: 6px;
+      }
+
+      .nav button {
+        min-height: 34px;
+        background: transparent;
+        border-color: transparent;
+        color: rgba(255, 255, 255, 0.68);
+      }
+
+      .nav button.active {
+        background: rgba(255, 255, 255, 0.12);
+        border-color: rgba(255, 255, 255, 0.16);
+        color: #fff;
+      }
+
+      .session {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: rgba(255, 255, 255, 0.72);
+        font-size: 13px;
+      }
+
+      .stage {
+        width: min(1580px, calc(100% - 36px));
+        margin: 0 auto;
+        padding: 18px 0 44px;
+        display: grid;
+        gap: 16px;
+      }
+
+      .hero-console {
+        display: grid;
+        grid-template-columns: minmax(380px, 0.82fr) minmax(0, 1.18fr) 280px;
+        gap: 14px;
+      }
+
+      .add-dock,
+      .now-panel,
+      .signal-panel,
+      .panel,
+      .media-tile,
+      .author-strip,
+      .queue-item {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: 0 1px 0 rgba(20, 27, 32, 0.03);
+      }
+
+      .add-dock {
+        display: grid;
+        gap: 12px;
+        padding: 14px;
+      }
+
+      .label {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .add-dock h1 {
+        font-size: 26px;
+        letter-spacing: 0;
+      }
+
+      .add-box {
+        display: grid;
+        gap: 10px;
+      }
+
+      .add-box textarea {
+        min-height: 148px;
+      }
+
+      .action-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .now-panel {
+        overflow: hidden;
+        display: grid;
+        grid-template-columns: minmax(220px, 330px) minmax(0, 1fr);
+        background: var(--dark);
+        color: #fff;
+        border-color: #10191c;
+      }
+
+      .poster {
+        min-height: 320px;
+        background: linear-gradient(145deg, #263136, #d7f2e6 44%, #275969);
+      }
+
+      .now-body {
+        display: grid;
+        align-content: space-between;
+        gap: 16px;
+        padding: 18px;
+      }
+
+      .now-body h2 {
+        font-size: 25px;
+        letter-spacing: 0;
+      }
+
+      .now-body .sub {
+        color: rgba(255, 255, 255, 0.7);
+      }
+
+      .download-meter {
+        display: grid;
+        gap: 8px;
+      }
+
+      .meter-track {
+        height: 9px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.14);
+      }
+
+      .meter-fill {
+        width: 72%;
+        height: 100%;
+        border-radius: inherit;
+        background: #34d399;
+      }
+
+      .signal-panel {
+        display: grid;
+        gap: 10px;
+        padding: 14px;
+      }
+
+      .signal {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 10px;
+      }
+
+      .signal:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+
+      .signal strong {
+        font-size: 20px;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 26px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        color: var(--muted);
+        padding: 0 9px;
+        font-size: 12px;
+      }
+
+      .badge.green {
+        background: var(--green-soft);
+        color: var(--green);
+        border-color: #b9ded7;
+      }
+
+      .content-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) 360px;
+        gap: 14px;
+      }
+
+      .panel {
+        padding: 14px;
+      }
+
+      .head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .head h2 {
+        margin-top: 2px;
+        font-size: 19px;
+        letter-spacing: 0;
+      }
+
+      .toolbar {
+        display: grid;
+        grid-template-columns: minmax(260px, 1fr) 140px 140px;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .media-grid {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .media-tile {
+        overflow: hidden;
+      }
+
+      .cover {
+        aspect-ratio: 3 / 4;
+        background: #d8e3e5;
+      }
+
+      .c1 { background: linear-gradient(145deg, #202a2e, #d6f0e7 42%, #245d6f); }
+      .c2 { background: linear-gradient(145deg, #2a211f, #f4c5b4 46%, #8b493b); }
+      .c3 { background: linear-gradient(145deg, #182126, #b7d8f1 50%, #244e8f); }
+      .c4 { background: linear-gradient(145deg, #25271e, #e1e6b6 48%, #667539); }
+      .c5 { background: linear-gradient(145deg, #231f2e, #d9c3f0 45%, #4b3872); }
+      .c6 { background: linear-gradient(145deg, #17251e, #c5ead0 48%, #2b6a4a); }
+
+      .tile-body {
+        display: grid;
+        gap: 5px;
+        padding: 9px 10px 10px;
+      }
+
+      .tile-body strong,
+      .queue-item strong,
+      .author-strip strong {
+        overflow-wrap: anywhere;
+      }
+
+      .sub {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .right-rail {
+        display: grid;
+        gap: 14px;
+      }
+
+      .author-strip {
+        display: grid;
+        grid-template-columns: 52px minmax(0, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+        padding: 10px;
+      }
+
+      .avatar {
+        width: 52px;
+        aspect-ratio: 1;
+        border-radius: 50%;
+        background: linear-gradient(145deg, #d8f2ea, #b9c8f0);
+      }
+
+      .queue {
+        display: grid;
+        gap: 10px;
+      }
+
+      .queue-item {
+        display: grid;
+        gap: 8px;
+        padding: 10px;
+      }
+
+      .progress {
+        height: 7px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #edf2f3;
+      }
+
+      .progress span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: var(--green);
+      }
+
+      .sync-board {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .sync-card {
+        display: grid;
+        gap: 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--soft);
+        padding: 12px;
+      }
+
+      .task-console {
+        display: grid;
+        gap: 9px;
+      }
+
+      .task-row {
+        display: grid;
+        grid-template-columns: 26px minmax(0, 1fr) 170px auto;
+        gap: 10px;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        padding: 10px;
+      }
+
+      .check {
+        width: 18px;
+        height: 18px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+      }
+
+      @media (max-width: 1240px) {
+        .hero-console,
+        .content-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .media-grid,
+        .sync-board {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 760px) {
+        .top,
+        .now-panel,
+        .toolbar,
+        .task-row,
+        .author-strip {
+          grid-template-columns: 1fr;
+        }
+
+        .nav {
+          justify-content: start;
+          overflow-x: auto;
+        }
+
+        .media-grid,
+        .sync-board {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <div class="mark"></div>
+          <strong>ClipNest</strong>
+        </div>
+        <nav class="nav">
+          <button class="active" type="button">工作台</button>
+          <button type="button">媒体库</button>
+          <button type="button">同步</button>
+          <button type="button">任务</button>
+          <button type="button">设置</button>
+        </nav>
+        <div class="session">
+          <span>Cookie 正常</span>
+          <span>2 个下载中</span>
+        </div>
+      </header>
+
+      <main class="stage">
+        <section class="hero-console">
+          <section class="add-dock">
+            <div>
+              <p class="label">Command</p>
+              <h1>推送、解析、下载</h1>
+            </div>
+            <div class="add-box">
+              <textarea>https://www.douyin.com/video/7639689018468436971</textarea>
+              <div class="action-row">
+                <button type="button">解析清晰度</button>
+                <button class="secondary" type="button">批量默认最高</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="now-panel">
+            <div class="poster"></div>
+            <div class="now-body">
+              <div>
+                <p class="sub">正在下载</p>
+                <h2>双倍快乐 #richboy舞蹈挑战</h2>
+                <p class="sub">小莎莎 / 2160x3840 / H.265 / 1.6 MB/s</p>
+              </div>
+              <div class="download-meter">
+                <div class="meter-track"><div class="meter-fill"></div></div>
+                <div class="action-row">
+                  <span class="badge green">72%</span>
+                  <span class="badge">剩余 12 秒</span>
+                  <span class="badge">TG 完成通知</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="signal-panel">
+            <div class="signal"><span class="label">作品</span><strong>157</strong></div>
+            <div class="signal"><span class="label">排队</span><strong>11</strong></div>
+            <div class="signal"><span class="label">失败</span><strong>1</strong></div>
+            <div class="signal"><span class="label">占用</span><strong>38.4 GB</strong></div>
+          </section>
+        </section>
+
+        <section class="content-grid">
+          <section class="panel">
+            <div class="head">
+              <div>
+                <p class="label">Library</p>
+                <h2>媒体库</h2>
+              </div>
+              <button class="secondary" type="button">页内沉浸播放</button>
+            </div>
+            <div class="toolbar">
+              <input placeholder="搜索标题、作者或视频 ID" />
+              <select><option>最新发布</option></select>
+              <button class="secondary" type="button">作者视图</button>
+            </div>
+            <div class="media-grid">
+              <article class="media-tile"><div class="cover c1"></div><div class="tile-body"><strong>卡点舞挑战</strong><span class="sub">小莎莎 / 今天 19:21</span></div></article>
+              <article class="media-tile"><div class="cover c2"></div><div class="tile-body"><strong>双人舞片段</strong><span class="sub">小莎莎 / 4K</span></div></article>
+              <article class="media-tile"><div class="cover c3"></div><div class="tile-body"><strong>夜景随拍</strong><span class="sub">香香 / 2K</span></div></article>
+              <article class="media-tile"><div class="cover c4"></div><div class="tile-body"><strong>氛围感自拍</strong><span class="sub">梦中情女 / 1080p</span></div></article>
+              <article class="media-tile"><div class="cover c5"></div><div class="tile-body"><strong>收藏图集</strong><span class="sub">图集 / 12 张</span></div></article>
+              <article class="media-tile"><div class="cover c6"></div><div class="tile-body"><strong>随性舞蹈</strong><span class="sub">4K / 60fps</span></div></article>
+            </div>
+          </section>
+
+          <aside class="right-rail">
+            <section class="panel">
+              <div class="head">
+                <div>
+                  <p class="label">Authors</p>
+                  <h2>作者</h2>
+                </div>
+              </div>
+              <div class="queue">
+                <article class="author-strip"><div class="avatar"></div><div><strong>小莎莎</strong><p class="sub">最近同步：18:42 / 新增 129</p></div><button class="secondary" type="button">同步</button></article>
+                <article class="author-strip"><div class="avatar"></div><div><strong>香香</strong><p class="sub">最近同步：昨天 / 新增 7</p></div><button class="secondary" type="button">同步</button></article>
+                <article class="author-strip"><div class="avatar"></div><div><strong>超级加菲喵</strong><p class="sub">未同步 / 18 作品</p></div><button type="button">同步</button></article>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="head">
+                <div>
+                  <p class="label">Queue</p>
+                  <h2>任务</h2>
+                </div>
+                <button class="secondary" type="button">全部</button>
+              </div>
+              <div class="queue">
+                <article class="queue-item"><strong>双倍快乐 #richboy</strong><span class="sub">下载中 / 72%</span><div class="progress"><span style="width:72%"></span></div></article>
+                <article class="queue-item"><strong>作者同步：小莎莎</strong><span class="sub">完成 / 发现 133 / 新增 129</span><div class="progress"><span style="width:100%"></span></div></article>
+              </div>
+            </section>
+          </aside>
+        </section>
+
+        <section class="panel">
+          <div class="head">
+            <div>
+              <p class="label">Sync Board</p>
+              <h2>同步看板</h2>
+            </div>
+            <button type="button">同步当前页作者</button>
+          </div>
+          <div class="sync-board">
+            <article class="sync-card"><strong>小莎莎</strong><span class="sub">发现 133 / 新增 129 / 已存在 4 / 页 8</span><button class="secondary" type="button">查看作品</button></article>
+            <article class="sync-card"><strong>香香</strong><span class="sub">发现 24 / 新增 7 / 已存在 17 / 页 2</span><button class="secondary" type="button">查看作品</button></article>
+            <article class="sync-card"><strong>超级加菲喵</strong><span class="sub">未同步 / 已识别作者主页 ID</span><button type="button">开始同步</button></article>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="head">
+            <div>
+              <p class="label">Task Console</p>
+              <h2>任务控制台</h2>
+            </div>
+            <div class="action-row">
+              <button class="secondary" type="button">全选本页</button>
+              <button class="secondary" type="button">反选</button>
+              <button type="button">批量重下</button>
+            </div>
+          </div>
+          <div class="task-console">
+            <article class="task-row"><div class="check"></div><div><strong>双倍快乐 #richboy舞蹈挑战</strong><p class="sub">小莎莎 / 2160x3840 / H.265</p></div><span class="badge green">下载中</span><button class="secondary" type="button">详情</button></article>
+            <article class="task-row"><div class="check"></div><div><strong>作者同步：小莎莎</strong><p class="sub">发现 133 / 新增 129 / 已存在 4</p></div><span class="badge green">完成</span><button class="secondary" type="button">详情</button></article>
+            <article class="task-row"><div class="check"></div><div><strong>失效链接重试</strong><p class="sub">HTTP 403 / 等待自动重试</p></div><span class="badge">失败</span><button class="secondary" type="button">重试</button></article>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

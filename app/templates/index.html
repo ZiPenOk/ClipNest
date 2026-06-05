@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260601-06" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260605-15" />
   </head>
   <body>
     <div class="app-shell">
@@ -16,7 +16,9 @@
         <nav class="nav">
           <button class="nav-item active" data-view="dashboard" type="button">工作台</button>
           <button class="nav-item" data-view="library" type="button">媒体库</button>
+          <button class="nav-item" data-view="sync" type="button">同步</button>
           <button class="nav-item" data-view="tasks" type="button">任务</button>
+          <button class="nav-item" data-view="logs" type="button">日志</button>
           <button class="nav-item" data-view="settings" type="button">设置</button>
         </nav>
       </aside>
@@ -41,22 +43,76 @@
         <p class="summary" id="summary">-</p>
 
         <section class="view active" id="view-dashboard">
-          <section class="submit-panel">
-            <textarea id="urls" placeholder="https://v.douyin.com/..."></textarea>
-            <button id="submit" type="button" title="Add download">添加</button>
-          </section>
-          <section class="author-crawl-panel">
-            <div>
-              <p>作者主页</p>
-              <h2>批量抓取作品</h2>
+          <section class="dashboard-workbench-panel">
+            <div class="dashboard-workbench-head">
+              <div>
+                <p>Workbench</p>
+                <h2>首页工作台</h2>
+              </div>
+              <span>下载入队 / 作者预抓</span>
             </div>
-            <input id="author-crawl-url" type="url" placeholder="https://www.douyin.com/user/..." />
-            <input id="author-crawl-max" type="number" min="1" max="1000" step="1" value="200" title="最多抓取作品数" />
-            <button id="author-crawl-submit" class="secondary" type="button">抓取并加入队列</button>
-            <div id="author-crawl-result" class="author-crawl-result" hidden></div>
-            <section class="author-crawl-jobs" id="author-crawl-jobs"></section>
+            <div class="dashboard-action-grid">
+              <section class="dashboard-action-block quick-add-block">
+                <div class="command-head">
+                  <div>
+                    <p>Quick Add</p>
+                    <h2>添加下载</h2>
+                  </div>
+                  <span>单条 / 多条链接</span>
+                </div>
+                <textarea id="urls" placeholder="https://v.douyin.com/..."></textarea>
+                <button id="submit" type="button" title="Add download">添加到队列</button>
+              </section>
+              <section class="dashboard-action-block author-crawl-action">
+                <div class="command-head">
+                  <div>
+                    <p>Author Crawl</p>
+                    <h2>批量抓取作品</h2>
+                  </div>
+                  <span>主页作品批量入队</span>
+                </div>
+                <div class="author-crawl-fields">
+                  <input id="author-crawl-url" type="url" placeholder="https://www.douyin.com/user/..." />
+                  <input id="author-crawl-max" type="number" min="1" max="1000" step="1" value="200" title="最多抓取作品数" />
+                  <button id="author-crawl-submit" type="button">抓取并加入队列</button>
+                </div>
+                <div id="author-crawl-result" class="author-crawl-result" hidden></div>
+              </section>
+            </div>
+            <section class="author-crawl-jobs dashboard-crawl-strip" id="author-crawl-jobs"></section>
           </section>
           <section class="stats" id="stats"></section>
+          <section class="dashboard-insights">
+            <section class="dashboard-panel dashboard-trend-panel">
+              <div class="section-head compact">
+                <div>
+                  <p>趋势</p>
+                  <h2>近 14 天下载</h2>
+                </div>
+              </div>
+              <div id="dashboard-chart" class="mini-chart"></div>
+            </section>
+            <section class="dashboard-panel dashboard-recent-panel">
+              <div class="section-head compact">
+                <div>
+                  <p>最近</p>
+                  <h2>完成和失败</h2>
+                </div>
+              </div>
+              <div id="dashboard-recent" class="recent-list"></div>
+              <button class="dashboard-panel-link" data-view-jump="tasks" type="button">查看所有任务</button>
+            </section>
+          </section>
+          <section class="dashboard-panel dashboard-distribution-panel">
+            <div class="section-head compact">
+              <div>
+                <p>分布</p>
+                <h2>平台和类型</h2>
+              </div>
+            </div>
+            <div id="dashboard-platforms" class="platform-summary"></div>
+          </section>
+          <section class="authors" id="authors"></section>
           <section class="section-head">
             <div>
               <p>Queue</p>
@@ -71,13 +127,26 @@
           <section class="library-tabs">
             <button class="library-tab active" data-library-mode="authors" type="button">作者</button>
             <button class="library-tab" data-library-mode="media" type="button">作品</button>
+            <button class="library-tab" data-library-mode="records" type="button">记录</button>
           </section>
+          <section class="library-platform-tabs" id="library-platform-tabs" aria-label="媒体库平台">
+            <button class="active" data-library-platform="" type="button">全部平台</button>
+            <button data-library-platform="douyin" type="button">抖音</button>
+            <button data-library-platform="tiktok" type="button">TikTok</button>
+          </section>
+          <section class="library-overview" id="library-overview"></section>
           <section class="section-head">
             <div>
-              <p>Authors</p>
+              <p id="library-section-kicker">作者分组</p>
               <h2 id="library-section-title">作者</h2>
             </div>
-            <button class="secondary" id="library-refresh" type="button">刷新</button>
+            <div class="section-actions library-manage-toolbar">
+              <button class="secondary" id="library-refresh" type="button">刷新</button>
+              <button class="secondary" id="library-edit-toggle" type="button">管理</button>
+              <button class="secondary" id="library-select-page" type="button" hidden>全选本页</button>
+              <button class="secondary" id="library-invert-page" type="button" hidden>反选本页</button>
+              <button class="danger" id="library-delete-selected" type="button" hidden>删除所选</button>
+            </div>
           </section>
           <section class="library-controls">
             <input id="library-search" type="search" placeholder="搜索标题、作者或视频 ID" />
@@ -87,6 +156,7 @@
               <option value="image">图集</option>
             </select>
             <select id="library-sort" aria-label="Library sort">
+              <option value="publish_desc">最新发布</option>
               <option value="newest">最近下载</option>
               <option value="oldest">最早下载</option>
               <option value="size_desc">文件最大</option>
@@ -105,11 +175,119 @@
                 <p id="library-filter-label">All Media</p>
                 <h2>作品</h2>
               </div>
-              <button class="secondary" id="library-clear" type="button">全部作者</button>
+              <div class="section-actions">
+                <button class="secondary" id="library-play-mode" type="button">播放模式</button>
+                <button class="secondary" id="library-clear" type="button">全部作者</button>
+              </div>
             </section>
-            <section class="media-grid" id="library-media"></section>
+            <section class="media-gallery">
+              <button class="gallery-page gallery-page-left" data-library-page="media" data-page-delta="-1" type="button" aria-label="上一页">‹</button>
+              <section class="media-grid" id="library-media"></section>
+              <button class="gallery-page gallery-page-right" data-library-page="media" data-page-delta="1" type="button" aria-label="下一页">›</button>
+            </section>
             <section class="pagination" id="library-media-pagination"></section>
           </section>
+          <section id="library-records-panel" hidden>
+            <section class="record-tools">
+              <button class="secondary active" data-record-kind="media" type="button">媒体记录</button>
+              <button class="secondary" data-record-kind="deleted" type="button">已删除</button>
+              <button class="danger" id="record-clear-deleted" type="button" hidden>清空已删除记录</button>
+            </section>
+            <section class="record-filters">
+              <select id="record-status-filter" aria-label="记录状态">
+                <option value="finished">完成</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
+                <option value="active">进行中</option>
+                <option value="all">全部状态</option>
+              </select>
+              <input id="record-author-filter" type="search" placeholder="作者精确筛选" />
+              <select id="record-date-field" aria-label="日期字段">
+                <option value="download">下载时间</option>
+                <option value="publish">发布时间</option>
+                <option value="created">创建时间</option>
+              </select>
+              <input id="record-date-from" type="date" aria-label="开始日期" />
+              <input id="record-date-to" type="date" aria-label="结束日期" />
+              <button class="secondary" id="record-filter-clear" type="button">清空筛选</button>
+            </section>
+            <section class="record-table-wrap">
+              <table class="record-table">
+                <thead id="library-records-head"></thead>
+                <tbody id="library-records"></tbody>
+              </table>
+            </section>
+            <section class="pagination" id="library-records-pagination"></section>
+          </section>
+        </section>
+
+        <section class="view" id="view-sync" hidden>
+          <section class="section-head">
+            <div>
+              <p>Author Sync</p>
+              <h2>同步中心</h2>
+            </div>
+            <div class="section-actions">
+              <button class="secondary" id="sync-refresh" type="button">刷新</button>
+              <button class="secondary" id="sync-import-library" type="button">导入媒体库作者</button>
+              <button class="secondary" id="sync-run-enabled" type="button">同步启用作者</button>
+            </div>
+          </section>
+          <section class="sync-create-panel">
+            <div>
+              <strong>添加作者主页</strong>
+              <span>粘贴抖音作者主页链接，保存为可反复同步的作者源。</span>
+            </div>
+            <input id="sync-source-url" type="url" placeholder="https://www.douyin.com/user/..." />
+            <input id="sync-source-name" type="text" placeholder="作者名（可选）" />
+            <button id="sync-source-add" type="button">添加</button>
+          </section>
+          <section class="sync-controls">
+            <input id="sync-search" type="search" placeholder="搜索作者" />
+            <select id="sync-enabled-filter" title="同步源状态">
+              <option value="">全部同步源</option>
+              <option value="enabled">仅启用</option>
+              <option value="disabled">仅停用</option>
+            </select>
+            <select id="sync-page-size" title="每页显示数量">
+              <option value="12">每页 12 个</option>
+              <option value="24">每页 24 个</option>
+              <option value="48">每页 48 个</option>
+            </select>
+            <label class="inline-field">
+              <span>批量最多作品</span>
+              <input id="sync-max-items" type="number" min="1" max="1000" step="1" value="200" />
+            </label>
+          </section>
+          <section class="sync-bulk-actions" id="sync-bulk-actions">
+            <span id="sync-bulk-count">已选择 0 个作者</span>
+            <button class="secondary" id="sync-select-page" type="button">全选本页</button>
+            <button class="secondary" id="sync-invert-page" type="button">反选本页</button>
+            <button class="secondary" id="sync-clear-selection" type="button">清空选择</button>
+            <button class="secondary" id="sync-apply-defaults" type="button">应用默认参数</button>
+            <button class="secondary" id="sync-enable-selected" type="button">启用所选</button>
+            <button class="secondary" id="sync-disable-selected" type="button">停用所选</button>
+            <button class="secondary" id="sync-run-selected" type="button">增量所选</button>
+            <button class="secondary" id="sync-run-selected-full" type="button">全量所选</button>
+            <button class="danger" id="sync-delete-selected" type="button">删除所选源</button>
+          </section>
+          <section class="sync-overview" id="sync-overview"></section>
+          <section class="sync-workspace">
+            <section class="sync-author-list" id="sync-authors"></section>
+            <aside class="sync-detail-panel" id="sync-detail" hidden></aside>
+          </section>
+          <section class="pagination" id="sync-authors-pagination"></section>
+          <section class="section-head compact">
+            <div>
+              <p>Sync Queue</p>
+              <h2>同步任务</h2>
+            </div>
+            <div class="section-actions">
+              <button class="secondary" id="sync-jobs-refresh" type="button">刷新任务</button>
+              <button class="secondary" id="sync-jobs-cleanup" type="button">清理已结束</button>
+            </div>
+          </section>
+          <section class="author-crawl-jobs sync-jobs" id="sync-crawl-jobs"></section>
         </section>
 
         <section class="view" id="view-tasks" hidden>
@@ -120,35 +298,108 @@
             </div>
             <button class="secondary" id="tasks-refresh" type="button">刷新任务</button>
           </section>
-          <section class="filters">
-            <input id="search" type="search" placeholder="搜索任务" />
-            <select id="status-filter" aria-label="Status">
+          <section class="task-control-panel">
+            <section class="task-platform-tabs" id="task-platform-tabs" aria-label="任务平台">
+              <button class="active" data-task-platform="" type="button">全部下载</button>
+              <button data-task-platform="douyin" type="button">抖音</button>
+              <button data-task-platform="tiktok" type="button">TikTok</button>
+            </section>
+            <section class="filters">
+              <input id="search" type="search" placeholder="搜索任务" />
+              <select id="status-filter" aria-label="Status">
+                <option value="">全部状态</option>
+                <option value="queued">排队</option>
+                <option value="retry">重试</option>
+                <option value="parsing">解析</option>
+                <option value="downloading">下载</option>
+                <option value="cancelling">取消中</option>
+                <option value="cancelled">已取消</option>
+                <option value="finished">完成</option>
+                <option value="failed">失败</option>
+              </select>
+            </section>
+            <section class="task-cleanup-actions">
+              <button class="secondary" id="tasks-clear-failed" type="button">清理失败记录</button>
+              <button class="secondary" id="tasks-clear-cancelled" type="button">清理取消记录</button>
+            </section>
+          </section>
+          <section class="bulk-actions" id="bulk-actions" hidden>
+            <span id="bulk-count">已选择 0 个任务</span>
+            <div class="bulk-select-tools">
+              <button class="secondary" id="tasks-select-all" type="button">全选本页</button>
+              <button class="secondary" id="tasks-invert-selection" type="button">反选本页</button>
+              <button class="secondary" id="tasks-clear-selection" type="button">清空选择</button>
+            </div>
+            <div class="bulk-main-actions">
+              <button class="secondary" id="bulk-retry" type="button">批量重试</button>
+              <button class="secondary" id="bulk-redownload" type="button">批量重下</button>
+              <button class="secondary" id="bulk-cancel" type="button">批量取消</button>
+              <button class="danger" id="bulk-delete" type="button">批量删记录</button>
+            </div>
+          </section>
+          <section class="task-section-head">
+            <div>
+              <p>Downloads</p>
+              <h3 id="download-task-title">下载任务</h3>
+            </div>
+            <span id="download-task-count">0 个任务</span>
+          </section>
+          <section class="jobs" id="jobs"></section>
+          <section class="pagination" id="tasks-pagination"></section>
+          <section class="task-section-head">
+            <div>
+              <p>Author Sync</p>
+              <h3>作者同步任务</h3>
+            </div>
+            <span id="author-crawl-task-count">0 个任务</span>
+          </section>
+          <section class="author-crawl-jobs task-crawl-jobs" id="task-author-crawls"></section>
+        </section>
+
+        <section class="view" id="view-logs" hidden>
+          <section class="section-head">
+            <div>
+              <p>Operations</p>
+              <h2>运维日志</h2>
+            </div>
+            <button class="secondary" id="logs-refresh" type="button">刷新日志</button>
+          </section>
+          <section class="logs-control-panel">
+            <input id="logs-search" type="search" placeholder="搜索任务、作者、链接、事件内容" />
+            <select id="logs-type-filter" aria-label="事件类型">
+              <option value="">全部事件</option>
+            </select>
+            <select id="logs-platform-filter" aria-label="平台">
+              <option value="">全部平台</option>
+              <option value="douyin">抖音</option>
+              <option value="tiktok">TikTok</option>
+            </select>
+            <select id="logs-status-filter" aria-label="任务状态">
               <option value="">全部状态</option>
+              <option value="finished">完成</option>
+              <option value="failed">失败</option>
+              <option value="cancelled">已取消</option>
               <option value="queued">排队</option>
               <option value="retry">重试</option>
               <option value="parsing">解析</option>
               <option value="downloading">下载</option>
-              <option value="cancelling">取消中</option>
-              <option value="cancelled">已取消</option>
-              <option value="finished">完成</option>
-              <option value="failed">失败</option>
             </select>
+            <input id="logs-date-from" type="date" aria-label="开始日期" />
+            <input id="logs-date-to" type="date" aria-label="结束日期" />
+            <button class="secondary" id="logs-clear-filter" type="button">清空筛选</button>
           </section>
-          <section class="bulk-actions" id="bulk-actions" hidden>
-            <span id="bulk-count">已选择 0 个任务</span>
-            <button class="secondary" id="bulk-retry" type="button">批量重试</button>
-            <button class="secondary" id="bulk-redownload" type="button">批量重下</button>
-            <button class="secondary" id="bulk-cancel" type="button">批量取消</button>
-            <button class="danger" id="bulk-delete" type="button">批量删除</button>
-          </section>
-          <section class="authors" id="authors"></section>
-          <section class="jobs" id="jobs"></section>
-          <section class="pagination" id="tasks-pagination"></section>
+          <section class="logs-overview" id="logs-overview"></section>
+          <section class="logs-task-list" id="logs-events"></section>
+          <section class="pagination" id="logs-pagination"></section>
         </section>
 
         <section class="view" id="view-settings" hidden>
           <section class="settings-grid">
             <div class="settings-form">
+              <div class="settings-group-head">
+                <span>账号与解析</span>
+                <strong>Cookie、解析器和签名状态</strong>
+              </div>
               <div class="parser-panel">
                 <div>
                   <span>解析器</span>
@@ -161,6 +412,7 @@
                 <select id="setting-parser-adapter">
                   <option value="native_douyin">native_douyin（推荐）</option>
                   <option value="native_douyin_share">native_douyin_share</option>
+                  <option value="native_tiktok">native_tiktok</option>
                 </select>
               </label>
               <label class="field-row">
@@ -168,6 +420,11 @@
                 <textarea id="setting-douyin-cookie" rows="4" placeholder="留空表示不修改当前 Cookie"></textarea>
               </label>
               <div class="hint" id="setting-douyin-cookie-status">-</div>
+              <label class="field-row">
+                <span>TikTok Cookie</span>
+                <textarea id="setting-tiktok-cookie" rows="4" placeholder="留空表示不修改当前 Cookie"></textarea>
+              </label>
+              <div class="hint" id="setting-tiktok-cookie-status">-</div>
               <label class="field-row">
                 <span>User-Agent</span>
                 <input id="setting-douyin-user-agent" type="text" />
@@ -180,6 +437,10 @@
             </div>
 
             <div class="settings-form">
+              <div class="settings-group-head">
+                <span>下载规则</span>
+                <strong>队列、重试、命名和目录</strong>
+              </div>
               <label class="check-row">
                 <input id="setting-skip-existing" type="checkbox" />
                 <span>跳过已存在文件</span>
@@ -208,6 +469,10 @@
                 <span>文件名模板</span>
                 <input id="setting-filename-template" type="text" />
               </label>
+              <div class="settings-group-head compact">
+                <span>通知</span>
+                <strong>Telegram 下载完成/失败提醒</strong>
+              </div>
               <label class="check-row">
                 <input id="setting-telegram-enabled" type="checkbox" />
                 <span>启用 Telegram 下载通知</span>
@@ -237,8 +502,13 @@
             </div>
 
             <div class="maintenance-panel">
+              <div class="settings-group-head maintenance-title">
+                <span>系统维护</span>
+                <strong>检查状态、备份、缓存和清理</strong>
+              </div>
               <button id="maintenance-health" class="secondary" type="button">健康信息</button>
               <button id="maintenance-cookie" class="secondary" type="button">Cookie 状态</button>
+              <button id="maintenance-tiktok" class="secondary" type="button">TikTok 诊断</button>
               <button id="maintenance-events" class="secondary" type="button">最近事件</button>
               <button id="maintenance-export" class="secondary" type="button">导出配置</button>
               <button id="maintenance-backup" class="secondary" type="button">备份数据库</button>
@@ -247,6 +517,10 @@
               <button id="maintenance-clean-duplicates" class="danger" type="button">清理重复记录</button>
               <button id="maintenance-orphans" class="secondary" type="button">扫描孤儿文件</button>
               <button id="maintenance-clean-orphans" class="danger" type="button">清理孤儿文件</button>
+              <div class="maintenance-help">
+                <strong>失败排查</strong>
+                <span>403/登录/Cookie 多半需要更新 Cookie；TikTok 失败优先检查地区访问和 TikTok Cookie。</span>
+              </div>
               <div id="maintenance-output" hidden></div>
             </div>
           </section>
@@ -292,6 +566,14 @@
       </header>
       <div id="job-detail" class="drawer-body"></div>
     </aside>
-    <script src="/static/app.js?v=20260601-06"></script>
+    <section class="reel-viewer" id="reel-viewer" hidden>
+      <button class="reel-close" id="reel-close" type="button" aria-label="关闭">×</button>
+      <button class="reel-nav reel-prev" id="reel-prev" type="button" aria-label="上一条">上一条</button>
+      <section class="reel-stage" id="reel-stage"></section>
+      <button class="reel-nav reel-next" id="reel-next" type="button" aria-label="下一条">下一条</button>
+      <button class="reel-nav reel-delete" id="reel-delete" type="button" aria-label="删除当前视频">删除</button>
+      <section class="reel-info" id="reel-info"></section>
+    </section>
+    <script src="/static/app.js?v=20260605-15"></script>
   </body>
 </html>

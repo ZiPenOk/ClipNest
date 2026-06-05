@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClipNest Redesign Preview</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f3f6f7;
+        --panel: #ffffff;
+        --panel-soft: #f8faf9;
+        --ink: #18212b;
+        --muted: #647383;
+        --line: #dce5e7;
+        --accent: #0f766e;
+        --accent-strong: #0b5f59;
+        --accent-soft: #e5f4f1;
+        --blue: #2958c8;
+        --blue-soft: #e9effc;
+        --warning: #a95b13;
+        --danger: #b42318;
+        --shadow: 0 18px 44px rgba(20, 33, 40, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.45;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        min-height: 38px;
+        border: 1px solid #17202c;
+        border-radius: 6px;
+        background: #17202c;
+        color: #fff;
+        padding: 0 14px;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: #fff;
+        color: var(--ink);
+        border-color: var(--line);
+      }
+
+      button.ghost {
+        background: transparent;
+        color: var(--muted);
+        border-color: transparent;
+      }
+
+      input,
+      select,
+      textarea {
+        width: 100%;
+        min-height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--ink);
+        padding: 10px 12px;
+      }
+
+      textarea {
+        min-height: 100px;
+        resize: vertical;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      .shell {
+        display: grid;
+        grid-template-columns: 238px minmax(0, 1fr);
+        min-height: 100vh;
+      }
+
+      .sidebar {
+        position: sticky;
+        top: 0;
+        height: 100vh;
+        border-right: 1px solid var(--line);
+        background: #ffffff;
+        padding: 20px 14px;
+      }
+
+      .brand {
+        display: grid;
+        grid-template-columns: 34px minmax(0, 1fr);
+        gap: 10px;
+        align-items: center;
+        padding: 2px 8px 22px;
+      }
+
+      .mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, #0f766e, #2958c8);
+        box-shadow: 0 12px 24px rgba(15, 118, 110, 0.2);
+      }
+
+      .brand strong {
+        display: block;
+        font-size: 21px;
+        letter-spacing: 0;
+      }
+
+      .brand span,
+      .muted,
+      .section-head p,
+      .topbar p {
+        color: var(--muted);
+      }
+
+      .nav {
+        display: grid;
+        gap: 6px;
+      }
+
+      .nav button {
+        display: flex;
+        justify-content: space-between;
+        width: 100%;
+        background: transparent;
+        color: var(--ink);
+        border-color: transparent;
+        text-align: left;
+      }
+
+      .nav button.active {
+        background: var(--accent-soft);
+        border-color: #bfe4dc;
+        color: var(--accent-strong);
+      }
+
+      .nav small {
+        color: var(--muted);
+      }
+
+      .main {
+        width: min(1500px, calc(100% - 36px));
+        margin: 0 auto;
+        padding: 22px 0 42px;
+      }
+
+      .topbar,
+      .section-head,
+      .row-between {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .topbar {
+        margin-bottom: 14px;
+      }
+
+      .topbar h1 {
+        font-size: 28px;
+        letter-spacing: 0;
+      }
+
+      .status-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        color: var(--muted);
+        padding: 0 10px;
+        font-size: 13px;
+      }
+
+      .view {
+        display: none;
+        gap: 14px;
+      }
+
+      .view.active {
+        display: grid;
+      }
+
+      .panel,
+      .metric,
+      .media-card,
+      .author-card,
+      .task-row,
+      .sync-row,
+      .setting-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: 0 1px 0 rgba(20, 33, 40, 0.02);
+      }
+
+      .panel {
+        padding: 14px;
+      }
+
+      .section-head h2 {
+        margin-top: 2px;
+        font-size: 19px;
+        letter-spacing: 0;
+      }
+
+      .command-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 240px;
+        gap: 14px;
+      }
+
+      .download-box {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 124px;
+        gap: 10px;
+      }
+
+      .download-box textarea {
+        min-height: 118px;
+      }
+
+      .download-box button {
+        height: 100%;
+      }
+
+      .quick-sync {
+        display: grid;
+        gap: 10px;
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .metric {
+        padding: 13px 14px;
+      }
+
+      .metric span {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 22px;
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+        gap: 14px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 10px;
+      }
+
+      .download-row,
+      .sync-row,
+      .task-row {
+        display: grid;
+        grid-template-columns: 84px minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        padding: 10px;
+      }
+
+      .thumb,
+      .cover {
+        overflow: hidden;
+        border-radius: 6px;
+        background: #d8e3e5;
+      }
+
+      .thumb {
+        width: 84px;
+        aspect-ratio: 3 / 4;
+      }
+
+      .cover {
+        width: 100%;
+        aspect-ratio: 3 / 4;
+      }
+
+      .c1 { background: linear-gradient(145deg, #162126, #d8f2ea 42%, #245d6f); }
+      .c2 { background: linear-gradient(145deg, #2d1d25, #f4c9bb 45%, #7c3d31); }
+      .c3 { background: linear-gradient(145deg, #132223, #b7d8f1 48%, #244e8f); }
+      .c4 { background: linear-gradient(145deg, #202117, #e2e7b8 48%, #596735); }
+      .c5 { background: linear-gradient(145deg, #251e2a, #d9c3f0 45%, #4b3872); }
+      .c6 { background: linear-gradient(145deg, #1b241f, #c5ead0 48%, #2b6a4a); }
+
+      .meta {
+        min-width: 0;
+        display: grid;
+        gap: 6px;
+      }
+
+      .meta strong,
+      .media-card strong,
+      .author-card strong,
+      .sync-row strong {
+        overflow-wrap: anywhere;
+      }
+
+      .sub {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .progress {
+        height: 7px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #edf2f3;
+      }
+
+      .bar {
+        height: 100%;
+        border-radius: inherit;
+        background: var(--accent);
+      }
+
+      .bar.blue {
+        background: var(--blue);
+      }
+
+      .recent-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .mini-card {
+        display: grid;
+        grid-template-columns: 58px minmax(0, 1fr);
+        gap: 10px;
+        align-items: center;
+      }
+
+      .mini-card .thumb {
+        width: 58px;
+      }
+
+      .library-toolbar,
+      .task-toolbar,
+      .sync-toolbar {
+        display: grid;
+        grid-template-columns: minmax(260px, 1fr) auto auto;
+        gap: 10px;
+      }
+
+      .tabs {
+        display: inline-flex;
+        width: fit-content;
+        gap: 4px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #e8eef0;
+        padding: 4px;
+      }
+
+      .tabs button {
+        min-height: 34px;
+        background: transparent;
+        color: var(--muted);
+        border-color: transparent;
+      }
+
+      .tabs button.active {
+        background: #fff;
+        color: var(--ink);
+        border-color: #d7e0e2;
+      }
+
+      .author-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .author-card {
+        display: grid;
+        grid-template-columns: 54px minmax(0, 1fr);
+        gap: 10px;
+        align-items: center;
+        padding: 12px;
+      }
+
+      .avatar {
+        width: 54px;
+        aspect-ratio: 1;
+        border-radius: 50%;
+        background: linear-gradient(145deg, #d7f1ea, #b8c8ee);
+      }
+
+      .media-frame {
+        position: relative;
+        padding: 0 54px;
+      }
+
+      .media-grid {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .media-card {
+        overflow: hidden;
+      }
+
+      .media-card .body {
+        display: grid;
+        gap: 5px;
+        padding: 9px 10px 10px;
+      }
+
+      .gallery-button {
+        position: absolute;
+        top: 36%;
+        width: 42px;
+        min-height: 88px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.94);
+        color: var(--ink);
+        border-color: #c9d5de;
+        box-shadow: var(--shadow);
+        font-size: 32px;
+      }
+
+      .gallery-button.left { left: 0; }
+      .gallery-button.right { right: 0; }
+
+      .reel-preview {
+        min-height: 620px;
+        overflow: hidden;
+        background: #050505;
+        color: #fff;
+        padding: 0;
+        display: grid;
+        place-items: center;
+        position: relative;
+      }
+
+      .phone-video {
+        height: 620px;
+        aspect-ratio: 9 / 16;
+        background: linear-gradient(145deg, #171b1d, #c8efdf 48%, #21565f);
+      }
+
+      .reel-info {
+        position: absolute;
+        left: 18px;
+        bottom: 18px;
+        width: min(360px, calc(100% - 36px));
+        display: grid;
+        gap: 5px;
+      }
+
+      .side-actions {
+        position: absolute;
+        right: 18px;
+        bottom: 76px;
+        display: grid;
+        gap: 10px;
+      }
+
+      .round-action {
+        width: 42px;
+        min-height: 42px;
+        border-radius: 999px;
+        border-color: rgba(255, 255, 255, 0.2);
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .sync-list,
+      .task-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .sync-row {
+        grid-template-columns: 54px minmax(0, 1fr) auto;
+      }
+
+      .sync-row .avatar {
+        width: 54px;
+      }
+
+      .task-row {
+        grid-template-columns: 22px 76px minmax(0, 1fr) 220px auto;
+      }
+
+      .checkbox {
+        width: 18px;
+        height: 18px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: #fff;
+      }
+
+      .task-status {
+        display: grid;
+        gap: 6px;
+      }
+
+      .bulk-strip {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        border-color: #cbe3dd;
+        background: #f7fcfa;
+      }
+
+      .bulk-strip span {
+        margin-right: auto;
+        color: var(--muted);
+      }
+
+      .settings-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .setting-card {
+        display: grid;
+        gap: 12px;
+        padding: 14px;
+      }
+
+      .field {
+        display: grid;
+        grid-template-columns: 160px minmax(0, 1fr);
+        gap: 10px;
+        align-items: center;
+      }
+
+      .field span {
+        color: var(--muted);
+      }
+
+      .maintenance {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      @media (max-width: 1120px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          position: static;
+          height: auto;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .nav {
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+        }
+
+        .metrics,
+        .author-grid,
+        .media-grid,
+        .maintenance {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .split,
+        .command-grid,
+        .settings-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .main {
+          width: min(100% - 22px, 1500px);
+        }
+
+        .topbar,
+        .section-head,
+        .download-box,
+        .library-toolbar,
+        .task-toolbar,
+        .sync-toolbar,
+        .download-row,
+        .sync-row,
+        .task-row,
+        .field {
+          display: grid;
+          grid-template-columns: 1fr;
+        }
+
+        .nav,
+        .metrics,
+        .recent-grid,
+        .author-grid,
+        .media-grid,
+        .maintenance {
+          grid-template-columns: 1fr;
+        }
+
+        .media-frame {
+          padding: 0;
+        }
+
+        .gallery-button {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark"></div>
+          <div>
+            <strong>ClipNest</strong>
+            <span>Douyin Library</span>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="active" data-view="dashboard" type="button">工作台 <small>12</small></button>
+          <button data-view="library" type="button">媒体库 <small>157</small></button>
+          <button data-view="sync" type="button">同步 <small>2</small></button>
+          <button data-view="tasks" type="button">任务 <small>8</small></button>
+          <button data-view="settings" type="button">设置</button>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p id="kicker">工作台</p>
+            <h1 id="title">下载工作台</h1>
+          </div>
+          <div class="status-strip">
+            <span class="pill">Cookie 正常</span>
+            <span class="pill">TG 已连接</span>
+            <span class="pill">2 个下载中</span>
+          </div>
+        </header>
+
+        <section class="view active" id="dashboard">
+          <section class="command-grid">
+            <div class="panel">
+              <div class="section-head">
+                <div>
+                  <p>Quick Add</p>
+                  <h2>添加下载</h2>
+                </div>
+                <button class="secondary" type="button">批量粘贴</button>
+              </div>
+              <div style="height: 12px"></div>
+              <div class="download-box">
+                <textarea placeholder="粘贴抖音链接，单条会先选择清晰度，批量默认最高画质"></textarea>
+                <button type="button">解析</button>
+              </div>
+            </div>
+            <div class="panel quick-sync">
+              <div>
+                <p class="muted">Author Sync</p>
+                <h2>作者同步</h2>
+              </div>
+              <input value="https://www.douyin.com/user/..." />
+              <button class="secondary" type="button">抓取并加入队列</button>
+              <span class="sub">上次同步：今天 18:42 / 新增 129</span>
+            </div>
+          </section>
+
+          <section class="metrics">
+            <div class="metric"><span>总作品</span><strong>157</strong></div>
+            <div class="metric"><span>运行中</span><strong>2</strong></div>
+            <div class="metric"><span>排队</span><strong>11</strong></div>
+            <div class="metric"><span>失败</span><strong>1</strong></div>
+            <div class="metric"><span>占用</span><strong>38.4 GB</strong></div>
+          </section>
+
+          <section class="split">
+            <div class="panel stack">
+              <div class="section-head">
+                <div>
+                  <p>Queue</p>
+                  <h2>正在下载</h2>
+                </div>
+                <button class="secondary" type="button">查看任务</button>
+              </div>
+              <article class="download-row">
+                <div class="thumb c1"></div>
+                <div class="meta">
+                  <strong>我也想被哥哥钓 #卡点舞 #抖音热门</strong>
+                  <span class="sub">梦中情女 / 2160x3840 / H.265</span>
+                  <div class="progress"><div class="bar" style="width: 68%"></div></div>
+                </div>
+                <button class="secondary" type="button">详情</button>
+              </article>
+              <article class="download-row">
+                <div class="thumb c2"></div>
+                <div class="meta">
+                  <strong>双倍快乐 #richboy舞蹈挑战</strong>
+                  <span class="sub">小莎莎 / 1440x2560 / 1.4 MB/s</span>
+                  <div class="progress"><div class="bar blue" style="width: 42%"></div></div>
+                </div>
+                <button class="secondary" type="button">详情</button>
+              </article>
+            </div>
+
+            <div class="panel stack">
+              <div class="section-head">
+                <div>
+                  <p>Recent</p>
+                  <h2>最近完成</h2>
+                </div>
+              </div>
+              <div class="recent-grid">
+                <div class="mini-card"><div class="thumb c3"></div><div><strong>随性舞蹈自拍</strong><p class="sub">4K / 9.4 MB</p></div></div>
+                <div class="mini-card"><div class="thumb c4"></div><div><strong>氛围感片段</strong><p class="sub">1080p / 5.1 MB</p></div></div>
+                <div class="mini-card"><div class="thumb c5"></div><div><strong>城市夜景</strong><p class="sub">2K / 8.8 MB</p></div></div>
+                <div class="mini-card"><div class="thumb c6"></div><div><strong>收藏作品</strong><p class="sub">图集 / 12 张</p></div></div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" id="library">
+          <div class="tabs">
+            <button class="active" type="button">作者</button>
+            <button type="button">作品</button>
+            <button type="button">播放模式</button>
+          </div>
+          <section class="library-toolbar">
+            <input placeholder="搜索作者、标题或视频 ID" />
+            <select><option>最新发布</option><option>最近下载</option><option>文件最大</option></select>
+            <button class="secondary" type="button">刷新</button>
+          </section>
+          <section class="author-grid">
+            <article class="author-card"><div class="avatar"></div><div><strong>小莎莎</strong><p class="sub">133 作品 / 最近同步：今天 18:42</p></div></article>
+            <article class="author-card"><div class="avatar"></div><div><strong>香香</strong><p class="sub">24 作品 / 最近同步：昨天 23:11</p></div></article>
+            <article class="author-card"><div class="avatar"></div><div><strong>超级加菲喵</strong><p class="sub">18 作品 / 未同步</p></div></article>
+            <article class="author-card"><div class="avatar"></div><div><strong>梦中情女</strong><p class="sub">41 作品 / 最近同步：今天 10:03</p></div></article>
+          </section>
+          <section class="media-frame">
+            <button class="gallery-button left" type="button">‹</button>
+            <div class="media-grid">
+              <article class="media-card"><div class="cover c1"></div><div class="body"><strong>卡点舞挑战</strong><span class="sub">小莎莎 / 发布：今天 19:21</span></div></article>
+              <article class="media-card"><div class="cover c2"></div><div class="body"><strong>双人舞片段</strong><span class="sub">小莎莎 / 4K / H.265</span></div></article>
+              <article class="media-card"><div class="cover c3"></div><div class="body"><strong>夜景随拍</strong><span class="sub">香香 / 2K</span></div></article>
+              <article class="media-card"><div class="cover c4"></div><div class="body"><strong>氛围感自拍</strong><span class="sub">梦中情女 / 1080p</span></div></article>
+              <article class="media-card"><div class="cover c5"></div><div class="body"><strong>收藏图集</strong><span class="sub">图集 / 12 张</span></div></article>
+              <article class="media-card"><div class="cover c6"></div><div class="body"><strong>随性舞蹈</strong><span class="sub">4K / 60fps</span></div></article>
+            </div>
+            <button class="gallery-button right" type="button">›</button>
+          </section>
+          <section class="panel reel-preview">
+            <div class="phone-video"></div>
+            <div class="reel-info">
+              <strong>双倍快乐 #richboy舞蹈挑战</strong>
+              <span>小莎莎 / 2160x3840 / H.265 / 9.4 MB</span>
+            </div>
+            <div class="side-actions">
+              <button class="round-action" type="button">↑</button>
+              <button class="round-action" type="button">↓</button>
+              <button class="round-action" type="button">×</button>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" id="sync">
+          <section class="sync-toolbar">
+            <input placeholder="搜索作者" />
+            <input value="200" />
+            <button type="button">同步当前页</button>
+          </section>
+          <section class="metrics">
+            <div class="metric"><span>作者总数</span><strong>12</strong></div>
+            <div class="metric"><span>本页可同步</span><strong>12</strong></div>
+            <div class="metric"><span>同步中</span><strong>1</strong></div>
+            <div class="metric"><span>今日新增</span><strong>129</strong></div>
+            <div class="metric"><span>最近完成</span><strong>18:42</strong></div>
+          </section>
+          <section class="sync-list">
+            <article class="sync-row">
+              <div class="avatar"></div>
+              <div class="meta">
+                <strong>小莎莎</strong>
+                <span class="sub">最近同步：今天 18:42 / 完成 / 新增 129</span>
+              </div>
+              <button type="button">同步</button>
+            </article>
+            <article class="sync-row">
+              <div class="avatar"></div>
+              <div class="meta">
+                <strong>香香</strong>
+                <span class="sub">最近同步：昨天 23:11 / 完成 / 新增 7</span>
+              </div>
+              <button class="secondary" type="button">同步</button>
+            </article>
+            <article class="sync-row">
+              <div class="avatar"></div>
+              <div class="meta">
+                <strong>超级加菲喵</strong>
+                <span class="sub">最近同步：未同步 / 已识别作者主页 ID</span>
+              </div>
+              <button class="secondary" type="button">同步</button>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" id="tasks">
+          <section class="task-toolbar">
+            <input placeholder="搜索任务" />
+            <select><option>全部状态</option><option>下载中</option><option>失败</option></select>
+            <button class="secondary" type="button">刷新任务</button>
+          </section>
+          <section class="panel bulk-strip">
+            <span>已选择 3 个任务</span>
+            <button class="secondary" type="button">全选本页</button>
+            <button class="secondary" type="button">反选本页</button>
+            <button class="secondary" type="button">批量重试</button>
+            <button class="secondary" type="button">批量重下</button>
+            <button type="button">批量删除</button>
+          </section>
+          <section class="task-list">
+            <article class="task-row">
+              <div class="checkbox"></div>
+              <div class="thumb c1"></div>
+              <div class="meta"><strong>双倍快乐 #richboy舞蹈挑战</strong><span class="sub">小莎莎 / 2160x3840 / H.265</span></div>
+              <div class="task-status"><span class="sub">下载中 68%</span><div class="progress"><div class="bar" style="width: 68%"></div></div></div>
+              <button class="secondary" type="button">详情</button>
+            </article>
+            <article class="task-row">
+              <div class="checkbox"></div>
+              <div class="thumb c2"></div>
+              <div class="meta"><strong>作者同步任务</strong><span class="sub">小莎莎 / 发现 133 / 新增 129</span></div>
+              <div class="task-status"><span class="sub">完成</span><div class="progress"><div class="bar" style="width: 100%"></div></div></div>
+              <button class="secondary" type="button">详情</button>
+            </article>
+          </section>
+        </section>
+
+        <section class="view" id="settings">
+          <section class="settings-grid">
+            <div class="setting-card">
+              <h2>解析设置</h2>
+              <label class="field"><span>抖音 Cookie</span><textarea placeholder="留空表示不修改"></textarea></label>
+              <label class="field"><span>User-Agent</span><input value="Mozilla/5.0 ..." /></label>
+              <label class="field"><span>A-Bogus</span><input value="local_abogus / 本地签名" /></label>
+            </div>
+            <div class="setting-card">
+              <h2>下载规则</h2>
+              <label class="field"><span>同时下载</span><input value="2" /></label>
+              <label class="field"><span>文件名模板</span><input value="{author}：{title}" /></label>
+              <label class="field"><span>TG 通知</span><input value="已启用 / 只通知完成" /></label>
+            </div>
+            <div class="panel maintenance">
+              <button class="secondary" type="button">健康信息</button>
+              <button class="secondary" type="button">Cookie 状态</button>
+              <button class="secondary" type="button">最近事件</button>
+              <button class="secondary" type="button">扫描重复</button>
+              <button class="secondary" type="button">缓存封面头像</button>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const titles = {
+        dashboard: ["工作台", "下载工作台"],
+        library: ["媒体库", "作者和作品"],
+        sync: ["同步", "作者作品同步"],
+        tasks: ["任务", "队列和历史"],
+        settings: ["设置", "规则和维护"],
+      };
+
+      document.querySelectorAll("[data-view]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const view = button.dataset.view;
+          document.querySelectorAll("[data-view]").forEach((item) => item.classList.toggle("active", item === button));
+          document.querySelectorAll(".view").forEach((item) => item.classList.toggle("active", item.id === view));
+          document.querySelector("#kicker").textContent = titles[view][0];
+          document.querySelector("#title").textContent = titles[view][1];
+        });
+      });
+    </script>
+  </body>
+</html>
