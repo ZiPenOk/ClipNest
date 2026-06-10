@@ -9,13 +9,14 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import db
-from .notifier import send_telegram_message
+from .notifier import platform_from_url, platform_text, send_telegram_message
 
 
 URL_RE = re.compile(r"https?://\S+")
 TRAILING_URL_PUNCTUATION = ".,;:!?)]}>，。；：！？）】》"
 DOUYIN_HOST_RE = re.compile(r"(^|\.)((douyin|iesdouyin)\.com)$", re.I)
 TIKTOK_HOST_RE = re.compile(r"(^|\.)tiktok\.com$", re.I)
+BILIBILI_HOST_RE = re.compile(r"(^|\.)(bilibili\.com|b23\.tv)$", re.I)
 RUNNING_CRAWL_STATUSES = {"queued", "running", "paused", "pausing", "cancelling"}
 STATUS_LABELS = {
     "queued": "排队中",
@@ -59,8 +60,16 @@ def is_tiktok_url(url: str) -> bool:
     return bool(TIKTOK_HOST_RE.search(host))
 
 
+def is_bilibili_url(url: str) -> bool:
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    return bool(BILIBILI_HOST_RE.search(host))
+
+
 def is_supported_url(url: str) -> bool:
-    return is_douyin_url(url) or is_tiktok_url(url)
+    return is_douyin_url(url) or is_tiktok_url(url) or is_bilibili_url(url)
 
 
 def is_author_url(url: str) -> bool:
@@ -94,6 +103,10 @@ def job_title(job: dict[str, Any]) -> str:
     return short_text(job.get("title") or job.get("description") or job.get("url") or f"#{job.get('id')}")
 
 
+def job_platform_text(job: dict[str, Any]) -> str:
+    return platform_text(job.get("platform"), job.get("url"))
+
+
 def status_keyboard(job_id: int) -> dict[str, Any]:
     return {"inline_keyboard": [[{"text": "刷新状态", "callback_data": f"status:{job_id}"}]]}
 
@@ -110,6 +123,7 @@ def job_status_text(job: dict[str, Any] | None) -> str:
     lines = [
         f"任务 #{job.get('id')} · {STATUS_LABELS.get(status, status or '-')}",
         f"标题：{job_title(job)}",
+        f"平台：{job_platform_text(job)}",
     ]
     author = str(job.get("author_name") or "").strip()
     if author:
@@ -161,7 +175,7 @@ def active_jobs_text(limit: int = 8) -> str:
     for job in jobs:
         status = STATUS_LABELS.get(str(job.get("status") or ""), str(job.get("status") or "-"))
         progress = float(job.get("progress") or 0)
-        lines.append(f"#{job.get('id')} · {status} · {progress:.1f}% · {job_title(job)}")
+        lines.append(f"#{job.get('id')} · {job_platform_text(job)} · {status} · {progress:.1f}% · {job_title(job)}")
     for crawl in crawls:
         status = CRAWL_STATUS_LABELS.get(str(crawl.get("status") or ""), str(crawl.get("status") or "-"))
         progress = float(crawl.get("progress") or 0)
@@ -312,11 +326,11 @@ class TelegramBotWorker:
 
     async def send_received_messages(self, token: str, chat_id: str, message_id: int, urls: list[str]) -> None:
         for url in urls:
-            kind = "作者主页链接" if is_author_url(url) else "下载链接"
+            kind = "作者主页链接" if is_douyin_url(url) and is_author_url(url) else "下载链接"
             await send_telegram_message(
                 token,
                 chat_id,
-                f"📥 ClipNest 已收到{kind}\n\n🔗 链接：{url}",
+                f"📥 ClipNest 已收到{kind}\n\n🏷️ 平台：{platform_text(platform_from_url(url), url)}\n🔗 链接：{url}",
                 reply_to_message_id=message_id,
             )
 
@@ -334,6 +348,7 @@ class TelegramBotWorker:
                 chat_id,
                 (
                     "🧾 ClipNest 作者抓取任务已创建\n\n"
+                    "🏷️ 平台：抖音\n"
                     f"🔗 链接：{crawl.get('url')}\n"
                     f"🧾 任务：作者抓取 #{crawl.get('id')}"
                 ),
@@ -348,6 +363,7 @@ class TelegramBotWorker:
                 chat_id,
                 (
                     f"{title}\n\n"
+                    f"🏷️ 平台：{job_platform_text(job)}\n"
                     f"🔗 链接：{job.get('url')}\n"
                     f"🧾 任务：#{job.get('id')}"
                 ),
@@ -366,7 +382,7 @@ class TelegramBotWorker:
             await send_telegram_message(
                 token,
                 chat_id,
-                "把抖音/TikTok 作品链接，或抖音作者主页链接发给我，我会加入 ClipNest 队列。\n/status 查看当前任务。",
+                "把抖音/TikTok/哔哩哔哩作品链接，或抖音作者主页链接发给我，我会加入 ClipNest 队列。\n/status 查看当前任务。",
                 reply_to_message_id=message_id,
             )
             return
@@ -378,7 +394,7 @@ class TelegramBotWorker:
             await send_telegram_message(
                 token,
                 chat_id,
-                "没有识别到支持的链接。\n直接发送抖音/TikTok 作品链接、抖音作者主页链接，或发送 /status 查看队列。",
+                "没有识别到支持的链接。\n直接发送抖音/TikTok/哔哩哔哩作品链接、抖音作者主页链接，或发送 /status 查看队列。",
                 reply_to_message_id=message_id,
             )
             return

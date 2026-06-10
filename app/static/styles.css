@@ -97,6 +97,87 @@ textarea {
   resize: vertical;
 }
 
+.auth-page {
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, rgba(15, 118, 110, 0.06), rgba(39, 88, 216, 0.04) 42%, transparent 100%),
+    var(--bg);
+}
+
+.auth-shell {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-panel {
+  width: min(100%, 420px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 24px;
+}
+
+.auth-brand {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  padding-left: 42px;
+  margin-bottom: 22px;
+}
+
+.auth-brand::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 1px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #0f766e, #2758d8);
+  box-shadow: 0 10px 22px rgba(15, 118, 110, 0.22);
+}
+
+.auth-brand strong {
+  font-size: 24px;
+  line-height: 1.1;
+}
+
+.auth-brand span,
+.auth-field label {
+  color: var(--muted);
+}
+
+.auth-form {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-field {
+  display: grid;
+  gap: 7px;
+}
+
+.auth-field label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.auth-form button {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 2px;
+}
+
+.auth-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 input[type="checkbox"] {
   width: 18px;
   min-height: 18px;
@@ -234,7 +315,6 @@ h2 {
   margin: 8px 0 12px;
 }
 
-.login-panel,
 .dashboard-workbench-panel,
 .stats,
 .filters,
@@ -254,15 +334,6 @@ h2 {
   border-radius: 8px;
 }
 
-.login-panel {
-  display: grid;
-  grid-template-columns: minmax(180px, 320px) auto;
-  gap: 8px;
-  align-items: center;
-  padding: 12px;
-}
-
-.login-panel[hidden],
 button[hidden],
 .view[hidden],
 .bulk-actions[hidden],
@@ -2028,6 +2099,11 @@ button[hidden],
   color: #047857;
 }
 
+.platform-badge.bilibili {
+  background: #eef8fb;
+  color: #0e7490;
+}
+
 .progress {
   height: 8px;
   background: #edf0f2;
@@ -3279,13 +3355,34 @@ body.reel-open {
   padding: 16px;
 }
 
-.quality-cover {
+.quality-cover-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
   width: 100%;
   aspect-ratio: 16 / 9;
-  object-fit: cover;
-  background: #e7eaf0;
+  overflow: hidden;
+  background: #f3f5f8;
   border: 1px solid var(--line);
   border-radius: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.quality-cover-wrap[data-state="ready"] span {
+  display: none;
+}
+
+.quality-cover-wrap[data-state="error"] {
+  background: #fff8f7;
+  border-color: #fecdd3;
+  color: #be123c;
+}
+
+.quality-cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .quality-meta {
@@ -3454,7 +3551,6 @@ body.reel-open {
   .dashboard-action-grid,
   .author-crawl-fields,
   .task-control-panel,
-  .login-panel,
   .library-controls,
   .library-overview,
   .logs-control-panel,

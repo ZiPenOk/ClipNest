@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import html
 import json
 import re
+import time
 from typing import Any, Protocol
-from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -898,6 +900,611 @@ class NativeTikTokParserAdapter:
         }
 
 
+class NativeBilibiliParserAdapter:
+    name = "native_bilibili"
+    nav_endpoint = "https://api.bilibili.com/x/web-interface/nav"
+    view_endpoint = "https://api.bilibili.com/x/web-interface/view"
+    playurl_endpoint = "https://api.bilibili.com/x/player/playurl"
+    author_post_endpoint = "https://api.bilibili.com/x/space/wbi/arc/search"
+    _BVID_RE = re.compile(r"\b(BV[0-9A-Za-z]{10})\b", re.I)
+    _AID_RE = re.compile(r"(?:^|[/?&#])av(\d+)\b|[?&]aid=(\d+)", re.I)
+    _SPACE_MID_RE = re.compile(r"space\.bilibili\.com/(\d+)", re.I)
+    _WBI_MIXIN_KEY_ENC_TAB = [
+        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+        27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+        37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+        22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+    ]
+    _QUALITY_HEIGHTS = {
+        127: 4320,
+        126: 1080,
+        125: 1080,
+        120: 2160,
+        116: 1080,
+        112: 1080,
+        80: 1080,
+        74: 720,
+        64: 720,
+        32: 480,
+        16: 360,
+        6: 240,
+    }
+    _QUALITY_LABELS = {
+        127: "8K",
+        126: "Dolby Vision",
+        125: "HDR",
+        120: "4K",
+        116: "1080P60",
+        112: "1080P+",
+        80: "1080P",
+        74: "720P60",
+        64: "720P",
+        32: "480P",
+        16: "360P",
+        6: "240P",
+    }
+
+    def __init__(self, parser_settings: dict[str, Any] | None = None):
+        self.parser_settings = parser_settings or {}
+        self._wbi_key: str = ""
+        self._wbi_key_expires_at: float = 0
+
+    async def parse(self, url: str) -> dict[str, Any]:
+        page_url = await self.resolve_video_url(url)
+        bvid = self.extract_bvid(page_url) or self.extract_bvid(url)
+        aid = self.extract_aid(page_url) or self.extract_aid(url)
+        if not bvid and not aid:
+            raise ParserError("Could not resolve Bilibili bvid/aid from URL")
+
+        view_data = await self.fetch_view(bvid=bvid, aid=aid, referer=page_url)
+        selected_page = self.select_page(view_data, page_url)
+        cid = int(selected_page.get("cid") or view_data.get("cid") or 0)
+        if not cid:
+            raise ParserError("Bilibili view response did not contain cid")
+
+        canonical_url = self.canonical_video_url(view_data, selected_page)
+        play_data = await self.fetch_playurl(view_data, cid, referer=canonical_url)
+        result = self.normalize_video(view_data, selected_page, play_data, canonical_url)
+        result["parser_source"] = "bilibili_web_api"
+        result["source_url"] = canonical_url
+        return result
+
+    async def resolve_video_url(self, url: str) -> str:
+        if self.extract_bvid(url) or self.extract_aid(url):
+            return url
+        timeout = httpx.Timeout(15.0, connect=6.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=self.request_headers(url))
+            response.raise_for_status()
+        resolved_url = str(response.url)
+        if self.extract_bvid(resolved_url) or self.extract_aid(resolved_url):
+            return resolved_url
+        raise ParserError("Could not resolve Bilibili short URL")
+
+    @classmethod
+    def extract_bvid(cls, url: str) -> str | None:
+        match = cls._BVID_RE.search(url)
+        return match.group(1) if match else None
+
+    @classmethod
+    def extract_aid(cls, url: str) -> str | None:
+        match = cls._AID_RE.search(url)
+        if not match:
+            return None
+        return next((group for group in match.groups() if group), None)
+
+    @classmethod
+    def extract_mid(cls, url: str) -> str:
+        match = cls._SPACE_MID_RE.search(str(url or ""))
+        return match.group(1) if match else ""
+
+    @classmethod
+    def is_author_url(cls, url: str) -> bool:
+        return bool(cls.extract_mid(url))
+
+    @staticmethod
+    def canonical_author_url(mid: str) -> str:
+        return f"https://space.bilibili.com/{str(mid).strip()}/upload/video"
+
+    @staticmethod
+    def author_space_referer(mid: str) -> str:
+        return f"https://space.bilibili.com/{str(mid).strip()}/"
+
+    @staticmethod
+    def extract_query_int(url: str, key: str) -> int:
+        try:
+            values = parse_qs(urlsplit(url).query).get(key) or []
+        except ValueError:
+            return 0
+        for value in values:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    async def fetch_view(self, bvid: str | None = None, aid: str | None = None, referer: str = "") -> dict[str, Any]:
+        params = {"bvid": bvid} if bvid else {"aid": aid}
+        timeout = httpx.Timeout(20.0, connect=8.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(self.view_endpoint, params=params, headers=self.request_headers(referer))
+            response.raise_for_status()
+        data = response.json()
+        if int(data.get("code") or 0) != 0:
+            raise ParserError(f"Bilibili view API failed: {data.get('message') or data.get('code')}")
+        view_data = data.get("data")
+        if not isinstance(view_data, dict):
+            raise ParserError("Bilibili view API did not return video data")
+        return view_data
+
+    async def fetch_playurl(self, view_data: dict[str, Any], cid: int, referer: str = "") -> dict[str, Any]:
+        params = {
+            "avid": str(view_data.get("aid") or ""),
+            "bvid": str(view_data.get("bvid") or ""),
+            "cid": str(cid),
+            "qn": "127",
+            "otype": "json",
+            "fourk": "1",
+            "fnver": "0",
+            "fnval": "4048",
+        }
+        params = {key: value for key, value in params.items() if value}
+        timeout = httpx.Timeout(20.0, connect=8.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(self.playurl_endpoint, params=params, headers=self.request_headers(referer))
+            response.raise_for_status()
+        data = response.json()
+        if int(data.get("code") or 0) != 0:
+            raise ParserError(f"Bilibili playurl API failed: {data.get('message') or data.get('code')}")
+        play_data = data.get("data")
+        if not isinstance(play_data, dict):
+            raise ParserError("Bilibili playurl API did not return stream data")
+        return play_data
+
+    def request_headers(self, referer: str | None = None) -> dict[str, str]:
+        user_agent = str(self.parser_settings.get("bilibili_user_agent") or settings.bilibili_user_agent)
+        cookie = normalize_cookie_header(self.parser_settings.get("bilibili_cookie") or settings.bilibili_cookie)
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": referer or "https://www.bilibili.com/",
+            "User-Agent": user_agent,
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
+    async def fetch_wbi_key(self) -> str:
+        now = time.time()
+        if self._wbi_key and now < self._wbi_key_expires_at:
+            return self._wbi_key
+        timeout = httpx.Timeout(15.0, connect=6.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(self.nav_endpoint, headers=self.request_headers("https://www.bilibili.com/"))
+            response.raise_for_status()
+        data = response.json()
+        wbi_img = (data.get("data") or {}).get("wbi_img") or {}
+        img_key = str(wbi_img.get("img_url") or "").rsplit("/", 1)[-1].split(".", 1)[0]
+        sub_key = str(wbi_img.get("sub_url") or "").rsplit("/", 1)[-1].split(".", 1)[0]
+        raw_key = img_key + sub_key
+        if len(raw_key) < 64:
+            raise ParserError("Bilibili WBI key response is incomplete")
+        self._wbi_key = "".join(raw_key[index] for index in self._WBI_MIXIN_KEY_ENC_TAB)[:32]
+        self._wbi_key_expires_at = now + 60 * 60 * 6
+        return self._wbi_key
+
+    @staticmethod
+    def clean_wbi_value(value: Any) -> str:
+        return "".join(char for char in str(value) if char not in "!'()*")
+
+    async def signed_wbi_params(self, params: dict[str, Any]) -> dict[str, str]:
+        mixin_key = await self.fetch_wbi_key()
+        signed = {
+            key: self.clean_wbi_value(value)
+            for key, value in params.items()
+            if value is not None and str(value) != ""
+        }
+        signed["wts"] = str(int(time.time()))
+        query = urlencode(dict(sorted(signed.items())))
+        signed["w_rid"] = hashlib.md5(f"{query}{mixin_key}".encode("utf-8")).hexdigest()
+        return signed
+
+    async def fetch_author_post_page(self, mid: str, page: int = 1, count: int = 30) -> dict[str, Any]:
+        clean_mid = str(mid or "").strip()
+        if not clean_mid.isdigit():
+            raise ParserError("Bilibili author mid is required")
+        page_no = max(1, int(page or 1))
+        page_size = max(1, min(50, int(count or 30)))
+        params = await self.signed_wbi_params(
+            {
+                "mid": clean_mid,
+                "pn": page_no,
+                "ps": page_size,
+                "order": "pubdate",
+                "platform": "web",
+                "web_location": "1550101",
+            }
+        )
+        timeout = httpx.Timeout(20.0, connect=8.0)
+        referer = self.author_space_referer(clean_mid)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(self.author_post_endpoint, params=params, headers=self.request_headers(referer))
+            response.raise_for_status()
+        data = response.json()
+        if int(data.get("code") or 0) != 0:
+            raise ParserError(f"Bilibili author posts API failed: {data.get('message') or data.get('code')}")
+        page_data = data.get("data")
+        if not isinstance(page_data, dict):
+            raise ParserError("Bilibili author posts API did not return page data")
+        post_list = page_data.get("list") or {}
+        vlist = post_list.get("vlist") if isinstance(post_list, dict) else []
+        items = [item for item in (vlist or []) if isinstance(item, dict)]
+        total = int((page_data.get("page") or {}).get("count") or len(items) or 0)
+        return {
+            "items": items,
+            "has_more": page_no * page_size < total and bool(items),
+            "cursor": page_no + 1,
+            "page": page_no,
+            "total": total,
+        }
+
+    @classmethod
+    def author_item_metadata(cls, item: dict[str, Any], mid: str) -> dict[str, Any]:
+        bvid = str(item.get("bvid") or "").strip()
+        aid = str(item.get("aid") or "").strip()
+        video_id = bvid or (f"av{aid}" if aid else "")
+        title = str(item.get("title") or item.get("description") or "").strip()
+        author_name = str(item.get("author") or "").strip()
+        clean_mid = str(item.get("mid") or mid or "").strip()
+        cover_url = str(item.get("pic") or "").strip()
+        if cover_url.startswith("http://"):
+            cover_url = f"https://{cover_url[len('http://'):]}"
+        source_url = f"https://www.bilibili.com/video/{video_id}/" if video_id else ""
+        avatar = {}
+        author = {
+            "uid": clean_mid,
+            "sec_uid": clean_mid,
+            "unique_id": clean_mid,
+            "nickname": author_name or clean_mid,
+            "avatar_thumb": avatar,
+            "avatar_medium": avatar,
+            "avatar_larger": avatar,
+        }
+        return {
+            "type": "video",
+            "platform": "bilibili",
+            "video_id": video_id,
+            "desc": title,
+            "create_time": int(item.get("created") or 0),
+            "author": author,
+            "statistics": {
+                "play_count": item.get("play"),
+                "comment_count": item.get("comment"),
+                "danmaku_count": item.get("video_review"),
+            },
+            "cover_url": cover_url,
+            "cover_data": {
+                "cover": {"url_list": [cover_url]} if cover_url else {},
+                "origin_cover": {"url_list": [cover_url]} if cover_url else {},
+            },
+            "video_data": {
+                "bvid": bvid,
+                "aid": aid,
+                "source_url": source_url,
+                "duration_text": str(item.get("length") or ""),
+                "bit_rate_candidates": [],
+            },
+        }
+
+    @classmethod
+    def author_items_from_page(cls, page: dict[str, Any], mid: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for item in page.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            metadata = cls.author_item_metadata(item, mid)
+            video_id = str(metadata.get("video_id") or "").strip()
+            if not video_id:
+                continue
+            results.append(
+                {
+                    "aweme_id": video_id,
+                    "url": str((metadata.get("video_data") or {}).get("source_url") or ""),
+                    "type": "video",
+                    "desc": metadata.get("desc"),
+                    "author_name": author_name_from_payload(metadata),
+                    "metadata": metadata,
+                }
+            )
+        return results
+
+    @classmethod
+    def select_page(cls, view_data: dict[str, Any], url: str) -> dict[str, Any]:
+        pages = [item for item in view_data.get("pages") or [] if isinstance(item, dict)]
+        cid = cls.extract_query_int(url, "cid")
+        if cid:
+            for page in pages:
+                if int(page.get("cid") or 0) == cid:
+                    return page
+        page_number = max(1, cls.extract_query_int(url, "p") or 1)
+        for page in pages:
+            if int(page.get("page") or 0) == page_number:
+                return page
+        if pages:
+            return pages[0]
+        return {
+            "cid": view_data.get("cid"),
+            "page": 1,
+            "part": view_data.get("title"),
+            "duration": view_data.get("duration"),
+            "dimension": view_data.get("dimension") or {},
+        }
+
+    @staticmethod
+    def canonical_video_url(view_data: dict[str, Any], page: dict[str, Any]) -> str:
+        video_id = str(view_data.get("bvid") or f"av{view_data.get('aid') or ''}").strip()
+        url = f"https://www.bilibili.com/video/{video_id}/"
+        page_number = int(page.get("page") or 1)
+        return f"{url}?p={page_number}" if page_number > 1 else url
+
+    @classmethod
+    def quality_label(cls, qn: int, quality_meta: dict[int, dict[str, Any]], accept_meta: dict[int, str]) -> str:
+        meta = quality_meta.get(qn) or {}
+        return (
+            str(meta.get("new_description") or meta.get("display_desc") or "").strip()
+            or accept_meta.get(qn)
+            or cls._QUALITY_LABELS.get(qn)
+            or f"QN{qn}"
+        )
+
+    @classmethod
+    def quality_height(cls, qn: int, label: str, height: int = 0) -> int:
+        if qn in cls._QUALITY_HEIGHTS:
+            return cls._QUALITY_HEIGHTS[qn]
+        match = re.search(r"(\d{3,4})\s*[pP]", label)
+        if match:
+            return int(match.group(1))
+        return height
+
+    @staticmethod
+    def stream_urls(item: dict[str, Any]) -> list[str]:
+        urls = [
+            item.get("baseUrl"),
+            item.get("base_url"),
+            item.get("url"),
+            *(item.get("backupUrl") or []),
+            *(item.get("backup_url") or []),
+        ]
+        normalized: list[str] = []
+        for url in urls:
+            text = str(url or "").strip().replace("http://", "https://", 1)
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    @staticmethod
+    def frame_rate(value: Any) -> int:
+        try:
+            return int(round(float(str(value or "").strip() or 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def codec_name(item: dict[str, Any]) -> str:
+        codecid = int(item.get("codecid") or 0)
+        codecs = str(item.get("codecs") or "").lower()
+        if codecid == 12 or codecs.startswith(("hev", "hvc")):
+            return "H.265"
+        if codecid == 13 or codecs.startswith("av01"):
+            return "AV1"
+        return "H.264"
+
+    @classmethod
+    def best_audio(cls, play_data: dict[str, Any]) -> dict[str, Any] | None:
+        dash = play_data.get("dash") or {}
+        audios = [item for item in dash.get("audio") or [] if isinstance(item, dict) and cls.stream_urls(item)]
+        if not audios:
+            return None
+        return sorted(audios, key=lambda item: int(item.get("bandwidth") or 0), reverse=True)[0]
+
+    @classmethod
+    def normalize_play_candidates(
+        cls,
+        play_data: dict[str, Any],
+        view_data: dict[str, Any],
+        selected_page: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        support_formats = [
+            item for item in play_data.get("support_formats") or []
+            if isinstance(item, dict)
+        ]
+        quality_meta = {int(item.get("quality") or 0): item for item in support_formats}
+        accept_quality = [int(value or 0) for value in play_data.get("accept_quality") or []]
+        accept_description = [str(value or "") for value in play_data.get("accept_description") or []]
+        accept_meta = {
+            qn: desc for qn, desc in zip(accept_quality, accept_description, strict=False)
+            if qn and desc
+        }
+        dash = play_data.get("dash") or {}
+        duration = int(dash.get("duration") or selected_page.get("duration") or view_data.get("duration") or 0)
+        audio = cls.best_audio(play_data)
+        audio_urls = cls.stream_urls(audio or {})
+        audio_bandwidth = int((audio or {}).get("bandwidth") or 0)
+        candidates: list[dict[str, Any]] = []
+        for index, item in enumerate(dash.get("video") or []):
+            if not isinstance(item, dict):
+                continue
+            urls = cls.stream_urls(item)
+            if not urls:
+                continue
+            qn = int(item.get("id") or play_data.get("quality") or 0)
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+            bandwidth = int(item.get("bandwidth") or 0)
+            label = cls.quality_label(qn, quality_meta, accept_meta)
+            codec = cls.codec_name(item)
+            candidate = {
+                "url": urls[0],
+                "back_urls": urls[1:],
+                "width": width,
+                "height": height,
+                "fps": cls.frame_rate(item.get("frameRate") or item.get("frame_rate")),
+                "bit_rate": bandwidth,
+                "data_size": int(((bandwidth + audio_bandwidth) * duration) / 8) if duration else 0,
+                "format": item.get("mimeType") or item.get("mime_type") or play_data.get("format"),
+                "gear_name": label,
+                "quality_type": qn,
+                "quality_label": label,
+                "quality_height": cls.quality_height(qn, label, height),
+                "codec": codec,
+                "codecs": item.get("codecs"),
+                "is_h265": codec == "H.265",
+                "is_av1": codec == "AV1",
+            }
+            if audio_urls:
+                candidate.update(
+                    {
+                        "merge": "dash",
+                        "audio_url": audio_urls[0],
+                        "audio_back_urls": audio_urls[1:],
+                        "audio_bit_rate": audio_bandwidth,
+                        "audio_format": (audio or {}).get("mimeType") or (audio or {}).get("mime_type"),
+                    }
+                )
+            candidates.append(candidate)
+
+        page_dimension = selected_page.get("dimension") or view_data.get("dimension") or {}
+        for index, item in enumerate(play_data.get("durl") or []):
+            if not isinstance(item, dict):
+                continue
+            urls = cls.stream_urls(item)
+            if not urls:
+                continue
+            qn = int(play_data.get("quality") or 0)
+            label = cls.quality_label(qn, quality_meta, accept_meta)
+            candidates.append(
+                {
+                    "url": urls[0],
+                    "back_urls": urls[1:],
+                    "width": int(page_dimension.get("width") or 0),
+                    "height": int(page_dimension.get("height") or 0),
+                    "fps": 0,
+                    "bit_rate": 0,
+                    "data_size": int(item.get("size") or 0),
+                    "format": play_data.get("format"),
+                    "gear_name": label or f"bilibili_durl_{index}",
+                    "quality_type": qn,
+                    "quality_label": label,
+                    "quality_height": cls.quality_height(qn, label, int(page_dimension.get("height") or 0)),
+                    "codec": "H.264",
+                    "is_h265": False,
+                    "is_av1": False,
+                }
+            )
+
+        return sorted(
+            candidates,
+            key=lambda item: (
+                int(item.get("quality_height") or 0),
+                max(int(item.get("width") or 0), int(item.get("height") or 0)),
+                min(int(item.get("width") or 0), int(item.get("height") or 0)),
+                int(bool(item.get("is_h265"))),
+                int(item.get("data_size") or 0),
+                int(item.get("bit_rate") or 0),
+            ),
+            reverse=True,
+        )
+
+    @classmethod
+    def normalize_author(cls, owner: dict[str, Any]) -> dict[str, Any]:
+        face = str(owner.get("face") or "").strip()
+        avatar = {"url_list": [face]} if face else {}
+        return {
+            **dict(owner or {}),
+            "uid": str(owner.get("mid") or owner.get("uid") or "").strip(),
+            "sec_uid": str(owner.get("mid") or owner.get("uid") or "").strip(),
+            "unique_id": str(owner.get("mid") or "").strip(),
+            "nickname": str(owner.get("name") or "").strip(),
+            "avatar_thumb": avatar,
+            "avatar_medium": avatar,
+            "avatar_larger": avatar,
+        }
+
+    @classmethod
+    def normalize_video(
+        cls,
+        view_data: dict[str, Any],
+        selected_page: dict[str, Any],
+        play_data: dict[str, Any],
+        source_url: str,
+    ) -> dict[str, Any]:
+        bvid = str(view_data.get("bvid") or "").strip()
+        aid = str(view_data.get("aid") or "").strip()
+        page_number = int(selected_page.get("page") or 1)
+        video_count = int(view_data.get("videos") or 1)
+        video_id = f"{bvid}_p{page_number}" if bvid and video_count > 1 else (bvid or f"av{aid}")
+        title = str(view_data.get("title") or "").strip()
+        part = str(selected_page.get("part") or "").strip()
+        desc = title
+        if video_count > 1 and part and part != title:
+            desc = f"{title} P{page_number} {part}"
+        candidates = cls.normalize_play_candidates(play_data, view_data, selected_page)
+        if not candidates:
+            raise ParserError("Bilibili playurl response did not expose downloadable streams")
+        direct_candidate = next((item for item in candidates if item.get("merge") != "dash"), None)
+        direct_url = str((direct_candidate or {}).get("url") or "")
+        cover_url = str(view_data.get("pic") or "").strip()
+        return {
+            "type": "video",
+            "platform": "bilibili",
+            "video_id": video_id,
+            "desc": desc or str(view_data.get("desc") or ""),
+            "create_time": view_data.get("pubdate") or view_data.get("ctime"),
+            "author": cls.normalize_author(view_data.get("owner") if isinstance(view_data.get("owner"), dict) else {}),
+            "statistics": view_data.get("stat"),
+            "cover_url": cover_url,
+            "cover_data": {
+                "cover": {"url_list": [cover_url]} if cover_url else {},
+                "origin_cover": {"url_list": [cover_url]} if cover_url else {},
+            },
+            "video_data": {
+                "wm_video_url": direct_url,
+                "wm_video_url_HQ": direct_url,
+                "nwm_video_url": direct_url,
+                "nwm_video_url_HQ": direct_url,
+                "bit_rate_candidates": candidates,
+                "bvid": bvid,
+                "aid": aid,
+                "cid": int(selected_page.get("cid") or 0),
+                "page": page_number,
+                "source_url": source_url,
+                "accept_quality": play_data.get("accept_quality") or [],
+                "support_formats": play_data.get("support_formats") or [],
+            },
+        }
+
+    async def health(self) -> dict[str, Any]:
+        return {
+            **self.info(),
+            "ok": True,
+            "stage": "web_api",
+            "cookie_configured": bool(self.parser_settings.get("bilibili_cookie") or settings.bilibili_cookie),
+            "warning": None,
+        }
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "adapter": self.name,
+            "detail_endpoint": self.view_endpoint,
+            "playurl_endpoint": self.playurl_endpoint,
+            "cookie_configured": bool(self.parser_settings.get("bilibili_cookie") or settings.bilibili_cookie),
+            "dependency_mode": "native_web_api",
+            "legacy_dependency": False,
+            "external_dependencies": ["ffmpeg"],
+            "capabilities": ["resolve_bvid_aid", "fetch_view", "fetch_playurl", "dash_merge", "author_posts"],
+        }
+
+
 def first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
     for key in keys:
         value = mapping.get(key)
@@ -927,6 +1534,19 @@ def is_tiktok_url(url: str) -> bool:
     return host == "tiktok.com" or host.endswith(".tiktok.com")
 
 
+def is_bilibili_url(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return (
+        host == "bilibili.com"
+        or host.endswith(".bilibili.com")
+        or host == "b23.tv"
+        or host.endswith(".b23.tv")
+    )
+
+
 def create_adapter(
     name: str | None = None,
     parser_settings: dict[str, Any] | None = None,
@@ -939,6 +1559,8 @@ def create_adapter(
         return NativeDouyinShareParserAdapter(parser_settings=parser_settings)
     if adapter_name == "native_tiktok":
         return NativeTikTokParserAdapter(parser_settings=parser_settings)
+    if adapter_name == "native_bilibili":
+        return NativeBilibiliParserAdapter(parser_settings=parser_settings)
     raise ParserError(f"Unknown parser adapter: {adapter_name}")
 
 
@@ -957,12 +1579,17 @@ class ParserClient:
 
     async def parse(self, url: str) -> dict[str, Any]:
         if not self.explicit_adapter:
+            if is_bilibili_url(url):
+                routed_adapter = NativeBilibiliParserAdapter(parser_settings=self.parser_settings)
+                result = await routed_adapter.parse(url)
+                result["_clipnest_adapter_name"] = routed_adapter.name
+                return result
             if is_tiktok_url(url):
                 routed_adapter = NativeTikTokParserAdapter(parser_settings=self.parser_settings)
                 result = await routed_adapter.parse(url)
                 result["_clipnest_adapter_name"] = routed_adapter.name
                 return result
-            if self.adapter.name == "native_tiktok":
+            if self.adapter.name in {"native_tiktok", "native_bilibili"}:
                 routed_adapter = NativeDouyinParserAdapter(parser_settings=self.parser_settings)
                 result = await routed_adapter.parse(url)
                 result["_clipnest_adapter_name"] = routed_adapter.name

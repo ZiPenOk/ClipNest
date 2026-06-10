@@ -8,7 +8,7 @@ from . import db, runtime_state
 from .config import settings
 from .downloader import DownloadCancelled, process_download
 from .notifier import notify_job
-from .parser import NativeDouyinParserAdapter
+from .parser import NativeBilibiliParserAdapter, NativeDouyinParserAdapter
 
 
 def retry_at(seconds: int) -> str:
@@ -38,6 +38,16 @@ def redact_sensitive_error(text: str) -> str:
     cleaned = re.sub(r"Illegal header value b'.*?'", "Illegal header value [redacted]", str(text), flags=re.S)
     cleaned = re.sub(r"(?i)(cookie|authorization):[^\n\r]+", r"\1: [redacted]", cleaned)
     return cleaned[:8000]
+
+
+def author_crawl_platform(job: dict, sync_source: dict | None = None) -> str:
+    platform = str((sync_source or {}).get("platform") or "").strip().lower()
+    if platform:
+        return platform
+    url = str(job.get("url") or "")
+    if NativeBilibiliParserAdapter.is_author_url(url):
+        return "bilibili"
+    return "douyin"
 
 
 class DownloadWorker:
@@ -252,12 +262,22 @@ class AuthorCrawlWorker:
 
         try:
             parser_settings = db.get_parser_settings(include_secret=True)
-            crawler = NativeDouyinParserAdapter(parser_settings=parser_settings)
+            platform = author_crawl_platform(job, sync_source)
+            crawler = (
+                NativeBilibiliParserAdapter(parser_settings=parser_settings)
+                if platform == "bilibili"
+                else NativeDouyinParserAdapter(parser_settings=parser_settings)
+            )
             sec_uid = str(job.get("sec_uid") or "")
             author_name = str(job.get("author_name") or "").strip()
             if not sec_uid:
                 db.update_author_crawl_job(crawl_id, message="正在解析作者主页", progress=1)
-                sec_uid = await crawler.resolve_sec_uid(str(job.get("url") or ""))
+                if platform == "bilibili":
+                    sec_uid = NativeBilibiliParserAdapter.extract_mid(str(job.get("url") or ""))
+                    if not sec_uid:
+                        raise RuntimeError("Bilibili UP 主主页链接缺少 mid")
+                else:
+                    sec_uid = await crawler.resolve_sec_uid(str(job.get("url") or ""))
                 db.update_author_crawl_job(crawl_id, sec_uid=sec_uid)
 
             has_more = True
@@ -283,7 +303,10 @@ class AuthorCrawlWorker:
                     progress=progress(),
                     message=f"正在{'增量' if incremental else ''}抓取第 {pages + 1} 页",
                 )
-                page = await crawler.fetch_author_post_page(sec_uid, max_cursor=cursor, count=18)
+                if platform == "bilibili":
+                    page = await crawler.fetch_author_post_page(sec_uid, page=max(1, cursor or 1), count=30)
+                else:
+                    page = await crawler.fetch_author_post_page(sec_uid, max_cursor=cursor, count=18)
                 pages += 1
                 page_items = crawler.author_items_from_page(page, sec_uid)
                 page_seen = 0
@@ -339,7 +362,10 @@ class AuthorCrawlWorker:
 
                 has_more = bool(page.get("has_more"))
                 try:
-                    cursor = int(page.get("max_cursor") or page.get("cursor") or 0)
+                    if platform == "bilibili":
+                        cursor = int(page.get("cursor") or 0)
+                    else:
+                        cursor = int(page.get("max_cursor") or page.get("cursor") or 0)
                 except (TypeError, ValueError):
                     cursor = 0
                 if page_seen > 0 and page_created == 0 and page_known > 0:

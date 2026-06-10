@@ -1,11 +1,18 @@
 // ==UserScript==
-// @name         ClipNest Douyin Remote Push
+// @name         ClipNest Remote Push
 // @namespace    https://clipnest.local/userscripts
-// @version      2026.06.02.1
-// @description  Detect the current Douyin video/note and push it to ClipNest for remote download.
+// @version      2026.06.10.12
+// @description  Detect the current Douyin, TikTok, or Bilibili work and push it to ClipNest for remote download.
 // @author       ClipNest
+// @match        *://douyin.com/*
 // @match        *://*.douyin.com/*
+// @match        *://iesdouyin.com/*
 // @match        *://*.iesdouyin.com/*
+// @match        *://tiktok.com/*
+// @match        *://*.tiktok.com/*
+// @match        *://bilibili.com/*
+// @match        *://*.bilibili.com/*
+// @match        *://b23.tv/*
 // @exclude      *://creator.douyin.com/*
 // @connect      *
 // @grant        GM_getValue
@@ -19,7 +26,7 @@
 (function () {
   "use strict";
 
-  const DEFAULT_BASE_URL = "http://10.10.10.200:8090";
+  const DEFAULT_BASE_URL = "http://localhost:8090";
   const DEFAULT_QUALITY = "best";
   const STORAGE_KEYS = {
     baseUrl: "clipnest.baseUrl",
@@ -62,6 +69,26 @@
     return String(gmGet(STORAGE_KEYS.quality, DEFAULT_QUALITY)).trim() || DEFAULT_QUALITY;
   }
 
+  function hostMatches(host, domain) {
+    return host === domain || host.endsWith(`.${domain}`);
+  }
+
+  function platformFromHref(href) {
+    try {
+      const host = new URL(href || location.href, location.href).hostname.toLowerCase();
+      if (hostMatches(host, "bilibili.com") || hostMatches(host, "b23.tv")) return "bilibili";
+      if (hostMatches(host, "tiktok.com")) return "tiktok";
+      if (hostMatches(host, "douyin.com") || hostMatches(host, "iesdouyin.com")) return "douyin";
+    } catch {
+      // Fall through to the default platform.
+    }
+    return "douyin";
+  }
+
+  function currentPlatform() {
+    return platformFromHref(location.href);
+  }
+
   function cleanUrl(value) {
     if (!value || typeof value !== "string") {
       return "";
@@ -69,7 +96,14 @@
     try {
       const url = new URL(value, location.href);
       url.hash = "";
-      if (!url.hostname.includes("douyin.com") && !url.hostname.includes("iesdouyin.com")) {
+      const host = url.hostname.toLowerCase();
+      const allowed =
+        hostMatches(host, "douyin.com") ||
+        hostMatches(host, "iesdouyin.com") ||
+        hostMatches(host, "tiktok.com") ||
+        hostMatches(host, "bilibili.com") ||
+        hostMatches(host, "b23.tv");
+      if (!allowed) {
         return "";
       }
       return url.toString();
@@ -86,6 +120,37 @@
     return `https://www.douyin.com/${kind}/${id}`;
   }
 
+  function canonicalBilibiliUrl(id, href) {
+    const cleanId = String(id || "").trim();
+    if (!cleanId) {
+      return "";
+    }
+    const url = new URL(`https://www.bilibili.com/video/${cleanId}/`);
+    try {
+      const source = new URL(href || location.href, location.href);
+      for (const key of ["p", "cid"]) {
+        const value = source.searchParams.get(key);
+        if (value) {
+          url.searchParams.set(key, value);
+        }
+      }
+    } catch {
+      // Current page may be a synthetic URL. Keep the canonical video URL.
+    }
+    return url.toString();
+  }
+
+  function canonicalTikTokUrl(author, id) {
+    const cleanAuthor = String(author || "").replace(/^@?/, "@").replace(/\/+$/, "");
+    const cleanId = String(id || "").trim();
+    if (!cleanId) {
+      return "";
+    }
+    return cleanAuthor
+      ? `https://www.tiktok.com/${cleanAuthor}/video/${cleanId}`
+      : `https://www.tiktok.com/video/${cleanId}`;
+  }
+
   function normalizeItem(item) {
     if (!item || !item.url) {
       return null;
@@ -94,6 +159,7 @@
       url: item.url,
       id: String(item.id || ""),
       type: item.type || "video",
+      platform: item.platform || platformFromHref(item.url),
       source: item.source || "unknown",
       desc: item.desc || "",
       author: item.author || "",
@@ -110,11 +176,73 @@
       return null;
     }
 
+    const platform = platformFromHref(url.toString());
     const path = url.pathname;
+    if (platform === "bilibili") {
+      let match = path.match(/\/video\/(BV[0-9A-Za-z]{10})/i);
+      if (match) {
+        const id = match[1];
+        return normalizeItem({
+          id,
+          platform,
+          type: "video",
+          url: canonicalBilibiliUrl(id, url.toString()),
+          source: "bilibili-url-path",
+        });
+      }
+      match = path.match(/\/video\/av(\d+)/i) || path.match(/\/av(\d+)/i);
+      if (match) {
+        const id = `av${match[1]}`;
+        return normalizeItem({
+          id,
+          platform,
+          type: "video",
+          url: canonicalBilibiliUrl(id, url.toString()),
+          source: "bilibili-url-path",
+        });
+      }
+      const bvid = url.searchParams.get("bvid") || "";
+      if (/^BV[0-9A-Za-z]{10}$/i.test(bvid)) {
+        return normalizeItem({
+          id: bvid,
+          platform,
+          type: "video",
+          url: canonicalBilibiliUrl(bvid, url.toString()),
+          source: "bilibili-query",
+        });
+      }
+      return null;
+    }
+
+    if (platform === "tiktok") {
+      let match = path.match(/^\/(@[^/]+)\/video\/(\d+)/);
+      if (match) {
+        return normalizeItem({
+          id: match[2],
+          platform,
+          type: "video",
+          url: canonicalTikTokUrl(match[1], match[2]),
+          source: "tiktok-url-path",
+        });
+      }
+      match = path.match(/^\/video\/(\d+)/);
+      if (match) {
+        return normalizeItem({
+          id: match[1],
+          platform,
+          type: "video",
+          url: canonicalTikTokUrl("", match[1]),
+          source: "tiktok-url-path",
+        });
+      }
+      return null;
+    }
+
     let match = path.match(/^\/(video|note)\/(\d+)/);
     if (match) {
       return normalizeItem({
         id: match[2],
+        platform,
         type: match[1] === "note" ? "note" : "video",
         url: canonicalDouyinUrl(match[2], match[1]),
         source: "url-path",
@@ -125,6 +253,7 @@
     if (match) {
       return normalizeItem({
         id: match[2],
+        platform,
         type: match[1] === "note" ? "note" : "video",
         url: canonicalDouyinUrl(match[2], match[1]),
         source: "share-path",
@@ -135,6 +264,7 @@
     if (match) {
       return normalizeItem({
         id: match[1],
+        platform,
         type: "video",
         url: canonicalDouyinUrl(match[1], "video"),
         source: "mobile-path",
@@ -150,6 +280,7 @@
       if (queryId && /^\d{8,}$/.test(queryId)) {
         return normalizeItem({
           id: queryId,
+          platform,
           type: "video",
           url: canonicalDouyinUrl(queryId, "video"),
           source: "query-id",
@@ -512,15 +643,190 @@
     return null;
   }
 
+  function tiktokVideoScore(video) {
+    if (!(video instanceof HTMLVideoElement) || !isVisible(video)) {
+      return -100000;
+    }
+    const rect = video.getBoundingClientRect();
+    const visibleWidth = Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0));
+    const visibleHeight = Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0));
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const distance = Math.abs(centerX - innerWidth / 2) + Math.abs(centerY - innerHeight / 2);
+    let score = (visibleWidth * visibleHeight) / 1000 - distance;
+    if (!video.paused) {
+      score += 1400;
+    }
+    if (video.readyState >= 2) {
+      score += 160;
+    }
+    if (rect.top <= innerHeight / 2 && rect.bottom >= innerHeight / 2) {
+      score += 600;
+    }
+    return score;
+  }
+
+  function tiktokVisibleVideos() {
+    return Array.from(document.querySelectorAll("video"))
+      .filter((video) => video instanceof HTMLVideoElement && isVisible(video))
+      .sort((a, b) => tiktokVideoScore(b) - tiktokVideoScore(a));
+  }
+
+  function tiktokIdFromDomContext(element) {
+    let current = element instanceof Element ? element : null;
+    let depth = 0;
+    while (current && current !== document && depth < 28) {
+      const elementId = String(current.id || "");
+      if (elementId.includes("xgwrapper")) {
+        const match = elementId.match(/\d{15,}/);
+        if (match) {
+          return match[0];
+        }
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    current = element instanceof Element ? element : null;
+    depth = 0;
+    while (current && current !== document && depth < 28) {
+      for (const key of ["data-item-id", "data-video-id", "data-aweme-id", "data-id"]) {
+        const match = String(current.getAttribute(key) || "").match(/\d{15,}/);
+        if (match) {
+          return match[0];
+        }
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    return "";
+  }
+
+  function tiktokAuthorFromDomContext(element) {
+    let current = element instanceof Element ? element : null;
+    let depth = 0;
+    while (current && current !== document && depth < 28) {
+      const links = current.querySelectorAll ? Array.from(current.querySelectorAll("a[href*='/@']")).slice(0, 40) : [];
+      for (const link of links) {
+        const href = link.href || link.getAttribute("href") || "";
+        const match = href.match(/\/(@[^/?#]+)/);
+        if (match && !match[1].includes("/")) {
+          return match[1].replace(/^@/, "");
+        }
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    return "";
+  }
+
+  function detectTikTokFromVisibleVideo() {
+    for (const video of tiktokVisibleVideos()) {
+      const id = tiktokIdFromDomContext(video);
+      if (id) {
+        const author = tiktokAuthorFromDomContext(video);
+        return normalizeItem({
+          id,
+          platform: "tiktok",
+          type: "video",
+          url: canonicalTikTokUrl(author, id),
+          source: "tiktok-visible-video",
+        });
+      }
+    }
+    return null;
+  }
+
+  function collectLinkValues(root, limit = 220) {
+    if (!root || !root.querySelectorAll) {
+      return [];
+    }
+    return Array.from(root.querySelectorAll("a[href]"))
+      .slice(0, limit)
+      .map((link) => link.href || link.getAttribute("href") || "");
+  }
+
+  function detectFromPageLinks(platform, rootElement, options = {}) {
+    const scopedOnly = options.scopedOnly === true;
+    const values = [];
+    const scopedRoots = uniqueElements([rootElement]).filter(Boolean);
+
+    for (const root of scopedRoots) {
+      values.push(...collectLinkValues(root));
+    }
+
+    if (scopedOnly) {
+      return firstDetectedFromValues(values, platform);
+    }
+
+    const canonical = document.querySelector("link[rel='canonical']");
+    const ogUrl = document.querySelector("meta[property='og:url'], meta[name='og:url']");
+    if (canonical && canonical.href) {
+      values.push(canonical.href);
+    }
+    if (ogUrl && ogUrl.content) {
+      values.push(ogUrl.content);
+    }
+
+    const roots = uniqueElements([rootElement, document.body, document.documentElement]).filter(Boolean);
+    for (const root of roots) {
+      const links = root.querySelectorAll ? Array.from(root.querySelectorAll("a[href]")).slice(0, 220) : [];
+      for (const link of links) {
+        values.push(link.href || link.getAttribute("href") || "");
+      }
+    }
+
+    const seen = new Set();
+    for (const value of values) {
+      const clean = String(value || "").trim();
+      if (!clean || seen.has(clean)) {
+        continue;
+      }
+      seen.add(clean);
+      const item = detectFromUrl(clean, { includeQuery: true });
+      if (item && item.platform === platform) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  function firstDetectedFromValues(values, platform) {
+    const seen = new Set();
+    for (const value of values) {
+      const clean = String(value || "").trim();
+      if (!clean || seen.has(clean)) {
+        continue;
+      }
+      seen.add(clean);
+      const item = detectFromUrl(clean, { includeQuery: true });
+      if (item && item.platform === platform) {
+        return item;
+      }
+    }
+    return null;
+  }
+
   function detectCurrentItem(rootElement) {
-    const item = (
-      detectFromUrl(location.href, { includeQuery: false }) ||
-      detectFromReact(rootElement) ||
-      detectFromUrl(location.href, { includeQuery: true }) ||
-      detectFromRouterData()
-    );
+    const platform = currentPlatform();
+    const detectionRoot = rootElement;
+    const item = platform === "douyin"
+      ? (
+        detectFromUrl(location.href, { includeQuery: false }) ||
+        detectFromReact(detectionRoot) ||
+        detectFromUrl(location.href, { includeQuery: true }) ||
+        detectFromRouterData()
+      )
+      : platform === "tiktok"
+        ? (
+          detectTikTokFromVisibleVideo()
+        )
+      : (
+        detectFromUrl(location.href, { includeQuery: true }) ||
+        detectFromPageLinks(platform, detectionRoot)
+      );
     if (item && !item.cover_url) {
-      item.cover_url = detectCoverFromDom(rootElement);
+      item.cover_url = detectCoverFromDom(detectionRoot);
     }
     return item;
   }
@@ -654,7 +960,7 @@
         <div class="clipnest-form">
           <label class="clipnest-field">
             <span>服务地址</span>
-            <input id="clipnest-setting-base-url" type="url" autocomplete="off" placeholder="http://10.10.10.200:8090" />
+            <input id="clipnest-setting-base-url" type="url" autocomplete="off" placeholder="http://localhost:8090" />
           </label>
           <label class="clipnest-field">
             <span>API Token</span>
@@ -702,7 +1008,7 @@
           throw new Error("服务地址必须是 http 或 https");
         }
       } catch {
-        showFieldError("服务地址格式不对，例如 http://10.10.10.200:8090");
+        showFieldError("服务地址格式不对，例如 http://localhost:8090");
         return;
       }
       if (!token) {
@@ -790,10 +1096,49 @@
       .${PLAYER_BUTTON_CLASS}.is-busy {
         background: rgba(15,139,255,.68);
       }
+      .clipnest-bilibili-button-host {
+        position: fixed;
+        z-index: 2147483000;
+        width: 34px;
+        height: 34px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transform: none;
+        pointer-events: auto;
+      }
+      .${PLAYER_BUTTON_CLASS}[data-clipnest-platform="bilibili"] {
+        width: 34px;
+        height: 34px;
+        margin: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #61666d;
+        vertical-align: middle;
+        pointer-events: auto;
+      }
+      .${PLAYER_BUTTON_CLASS}[data-clipnest-platform="bilibili"]:hover {
+        background: rgba(255,255,255,.14);
+        color: #00aeec;
+        transform: none;
+      }
+      .${PLAYER_BUTTON_CLASS}[data-clipnest-platform="tiktok"] {
+        flex: 0 0 auto;
+        margin: 8px auto;
+        background: rgba(22,24,35,.78);
+        box-shadow: 0 2px 10px rgba(0,0,0,.22);
+      }
+      .${PLAYER_BUTTON_CLASS}[data-clipnest-platform="tiktok"]:hover {
+        background: #fe2c55;
+      }
       .${PLAYER_BUTTON_CLASS} svg {
         width: 21px;
         height: 21px;
         display: block;
+      }
+      .${PLAYER_BUTTON_CLASS}[data-clipnest-platform="bilibili"] svg {
+        width: 19px;
+        height: 19px;
       }
       .${PLAYER_BUTTON_CLASS} .clipnest-spinner {
         width: 18px;
@@ -965,11 +1310,12 @@
     `;
   }
 
-  function createPlayerButton(container) {
+  function createPlayerButton(container, platform = currentPlatform()) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = PLAYER_BUTTON_CLASS;
     button.innerHTML = buttonIconHtml();
+    button.dataset.clipnestPlatform = platform;
     button.setAttribute("aria-label", "推送到 ClipNest");
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -978,7 +1324,17 @@
         openSettings();
         return;
       }
-      pushCurrent(Boolean(event.altKey), container.closest(".basePlayerContainer") || container);
+      const root =
+        platform === "tiktok"
+          ? container
+          : (
+            container.closest(".basePlayerContainer") ||
+            container.closest(".bpx-player-container") ||
+            container.closest("[data-e2e='browse-video']") ||
+            container.closest("[data-e2e='feed-video']") ||
+            container
+          );
+      pushCurrent(Boolean(event.altKey), root);
     });
     button.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -989,11 +1345,23 @@
   }
 
   function playerToolbars() {
-    const selectors = [
-      ".basePlayerContainer xg-right-grid",
-      ".basePlayerContainer [class*='right'][class*='grid']",
-      "[data-e2e='video-share-container']",
-    ];
+    const platform = currentPlatform();
+      const selectors = {
+      bilibili: [
+        ".video-toolbar-right",
+      ],
+      tiktok: [
+        ".e12khdsb2.css-1uj70ld-7937d88b--DivContentFlexLayout > .e12arnib0.css-11fh2ar-7937d88b--SectionActionBarContainer",
+        "[class*='DivContentFlexLayout'] > [class*='SectionActionBarContainer']",
+        "[data-e2e='browse-video'] [class*='ActionBarContainer']",
+        "[data-e2e='video-share-container']",
+      ],
+      douyin: [
+        ".basePlayerContainer xg-right-grid",
+        ".basePlayerContainer [class*='right'][class*='grid']",
+        "[data-e2e='video-share-container']",
+      ],
+    }[platform] || [];
     const result = [];
     const seen = new Set();
     for (const selector of selectors) {
@@ -1011,20 +1379,64 @@
   function ensurePlayerButtons() {
     addStyles();
     document.querySelectorAll(".clipnest-player-button-host").forEach((node) => node.remove());
+    const platform = currentPlatform();
+    if (platform === "bilibili") {
+      document.querySelectorAll(".clipnest-bilibili-button-host").forEach((node) => {
+        if (node.parentElement !== document.body) {
+          node.remove();
+        }
+      });
+    }
     for (const toolbar of playerToolbars()) {
+      if (platform === "bilibili") {
+        const existingHost = document.body.querySelector(".clipnest-bilibili-button-host");
+        if (existingHost && existingHost.querySelector(`.${PLAYER_BUTTON_CLASS}`)) {
+          positionBilibiliButtonHost(existingHost, toolbar);
+          continue;
+        }
+        const host = document.createElement("span");
+        host.className = "clipnest-bilibili-button-host";
+        host.append(createPlayerButton(toolbar, platform));
+        document.body.append(host);
+        positionBilibiliButtonHost(host, toolbar);
+        continue;
+      }
       if (toolbar.querySelector(`.${PLAYER_BUTTON_CLASS}`)) {
         continue;
       }
-      const player = toolbar.closest(".basePlayerContainer") || toolbar;
+      const player =
+        toolbar.closest(".basePlayerContainer") ||
+        toolbar.closest(".bpx-player-container") ||
+        toolbar.closest("[data-e2e='browse-video']") ||
+        toolbar.closest("[data-e2e='feed-video']") ||
+        toolbar;
       const existingInPlayer = player.querySelector(`.${PLAYER_BUTTON_CLASS}`);
       if (existingInPlayer && existingInPlayer.parentElement !== toolbar) {
         existingInPlayer.remove();
       } else if (existingInPlayer) {
         continue;
       }
-      const button = createPlayerButton(toolbar);
-      toolbar.prepend(button);
+      const button = createPlayerButton(toolbar, platform);
+      if (platform === "bilibili") {
+        toolbar.append(button);
+      } else {
+        toolbar.prepend(button);
+      }
     }
+  }
+
+  function positionBilibiliButtonHost(host, toolbar) {
+    if (!host || !toolbar || !(toolbar instanceof Element)) {
+      return;
+    }
+    const rect = toolbar.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      host.style.display = "none";
+      return;
+    }
+    host.style.display = "inline-flex";
+    host.style.left = `${Math.max(8, rect.left - 42)}px`;
+    host.style.top = `${Math.max(8, rect.top + (rect.height - 34) / 2)}px`;
   }
 
   function observeVideos(scheduleUpdate) {
@@ -1045,7 +1457,12 @@
     const buttons = Array.from(document.querySelectorAll(`.${PLAYER_BUTTON_CLASS}`));
     let firstItem = null;
     for (const button of buttons) {
-      const root = button.closest(".basePlayerContainer") || button.parentElement;
+      const root =
+        button.closest(".basePlayerContainer") ||
+        button.closest(".bpx-player-container") ||
+        button.closest("[data-e2e='browse-video']") ||
+        button.closest("[data-e2e='feed-video']") ||
+        button.parentElement;
       const item = detectCurrentItem(root);
       if (!firstItem && item) {
         firstItem = item;
@@ -1114,6 +1531,8 @@
     window.addEventListener("clipnest-location-change", scheduleUpdate);
     window.addEventListener("hashchange", scheduleUpdate);
     window.addEventListener("focus", scheduleUpdate);
+    window.addEventListener("resize", scheduleUpdate, { passive: true });
+    window.addEventListener("scroll", scheduleUpdate, { passive: true });
     new MutationObserver(scheduleObserveAndUpdate).observe(document.documentElement, {
       childList: true,
       subtree: true,

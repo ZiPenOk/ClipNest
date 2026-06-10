@@ -2,15 +2,18 @@ from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import html
+import ipaddress
 import math
+import os
 from pathlib import Path
 import re
 import time
 from typing import Annotated
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import Body, Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -20,7 +23,7 @@ from .assets import ASSET_ROOT, author_avatar_url_from_payload, cache_remote_ima
 from .config import settings
 from .downloader import build_download_headers, ordered_bit_rate_candidates, relative_media_path
 from .notifier import send_telegram
-from .parser import NativeDouyinParserAdapter, NativeTikTokParserAdapter, ParserClient, author_name_from_payload
+from .parser import NativeBilibiliParserAdapter, NativeDouyinParserAdapter, NativeTikTokParserAdapter, ParserClient, author_name_from_payload
 from .telegram_bot import TelegramBotWorker
 from .worker import AuthorCrawlWorker, DownloadWorker
 
@@ -134,7 +137,14 @@ class JobBulkAction(BaseModel):
 
 
 class SessionCreate(BaseModel):
-    token: str = Field(min_length=1)
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class SetupCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=80)
+    password: str = Field(min_length=8, max_length=200)
+    confirm_password: str = Field(min_length=8, max_length=200)
 
 
 class AppSettingsUpdate(BaseModel):
@@ -163,6 +173,8 @@ class ParserSettingsUpdate(BaseModel):
     douyin_user_agent: str | None = Field(default=None, max_length=500)
     tiktok_cookie: str | None = Field(default=None, max_length=20000)
     tiktok_user_agent: str | None = Field(default=None, max_length=500)
+    bilibili_cookie: str | None = Field(default=None, max_length=20000)
+    bilibili_user_agent: str | None = Field(default=None, max_length=500)
 
 
 RUNNING_STATUSES = {"parsing", "downloading", "cancelling"}
@@ -171,30 +183,76 @@ URL_RE = re.compile(r"https?://\S+")
 TRAILING_URL_PUNCTUATION = ".,;)" + "\uff0c\u3002\uff1b"
 SESSION_COOKIE_NAME = "clipnest_session"
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
+PASSWORD_HASH_ITERATIONS = 260_000
 
 
-def sign_session(created_at: int | None = None) -> str:
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        algorithm, iterations_text, salt_hex, digest_hex = password_hash.split("$", 3)
+        iterations = int(iterations_text)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except (ValueError, TypeError):
+        return False
+    if algorithm != "pbkdf2_sha256" or iterations < 100_000:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+def normalize_auth_username(username: str) -> str:
+    clean = str(username or "").strip()
+    if not clean:
+        return ""
+    return re.sub(r"\s+", "", clean)[:80]
+
+
+def sign_session(password_hash: str, created_at: int | None = None) -> str:
     timestamp = str(created_at or int(time.time()))
+    message = f"v2|{timestamp}".encode("utf-8")
     signature = hmac.new(
-        settings.api_token.encode("utf-8"),
-        timestamp.encode("utf-8"),
+        f"{settings.api_token}:{password_hash}".encode("utf-8"),
+        message,
         hashlib.sha256,
     ).hexdigest()
-    return f"{timestamp}.{signature}"
+    return f"v2.{timestamp}.{signature}"
 
 
 def verify_session(value: str | None) -> bool:
-    if not value or not settings.api_token:
+    if not value:
         return False
     try:
-        timestamp_text, signature = value.split(".", 1)
+        version, timestamp_text, signature = value.split(".", 2)
         timestamp = int(timestamp_text)
     except ValueError:
         return False
+    if version != "v2":
+        return False
     if time.time() - timestamp > SESSION_MAX_AGE_SECONDS:
         return False
-    expected = sign_session(timestamp)
+    admin = db.get_auth_admin()
+    if not admin:
+        return False
+    expected = sign_session(admin["password_hash"], timestamp)
     return hmac.compare_digest(value, expected)
+
+
+def create_session_cookie(response: Response, admin: dict[str, str]) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=sign_session(admin["password_hash"]),
+        max_age=SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+    )
 
 
 def extract_token(
@@ -379,13 +437,49 @@ def first_cover_url(payload: dict) -> str:
     return cover_url_from_payload(payload)
 
 
+def image_proxy_headers(url: str) -> dict[str, str]:
+    host = (urlsplit(url).hostname or "").lower()
+    parser_settings = db.get_parser_settings(include_secret=True)
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "User-Agent": settings.douyin_user_agent,
+    }
+    if "bilibili.com" in host or "hdslb.com" in host:
+        headers["Referer"] = "https://www.bilibili.com/"
+        headers["User-Agent"] = str(parser_settings.get("bilibili_user_agent") or settings.bilibili_user_agent)
+        cookie = str(parser_settings.get("bilibili_cookie") or settings.bilibili_cookie or "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
+    elif "douyin.com" in host or "douyinpic.com" in host or "douyinstatic.com" in host:
+        headers["Referer"] = "https://www.douyin.com/"
+        headers["User-Agent"] = str(parser_settings.get("douyin_user_agent") or settings.douyin_user_agent)
+    elif "tiktok.com" in host or "tiktokcdn" in host:
+        headers["Referer"] = "https://www.tiktok.com/"
+        headers["User-Agent"] = str(parser_settings.get("tiktok_user_agent") or settings.tiktok_user_agent)
+    return headers
+
+
+def is_private_proxy_host(host: str) -> bool:
+    if not host:
+        return True
+    lowered = host.lower().strip("[]")
+    if lowered in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback or address.is_link_local or address.is_multicast
+
+
 def format_quality_option(item: dict) -> dict:
     width = int(item.get("width") or 0)
     height = int(item.get("height") or 0)
-    shorter = min(width, height) if width and height else max(width, height)
+    shorter = int(item.get("quality_height") or 0) or (min(width, height) if width and height else max(width, height))
     fps = int(item.get("fps") or 0)
-    codec = "H.265" if item.get("is_h265") else "H.264"
-    label_parts = [f"{shorter}P" if shorter else "自动", f"{width}x{height}" if width and height else ""]
+    codec = str(item.get("codec") or ("H.265" if item.get("is_h265") else "H.264"))
+    quality_label = str(item.get("quality_label") or "").strip()
+    label_parts = [quality_label or (f"{shorter}P" if shorter else "自动"), f"{width}x{height}" if width and height else ""]
     if fps:
         label_parts.append(f"{fps}fps")
     label_parts.append(codec)
@@ -480,36 +574,72 @@ if TOOLS_DIR.exists():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def index(request: Request, clipnest_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE_NAME)] = None):
+    if not db.auth_admin_configured():
+        return RedirectResponse("/login?setup=1", status_code=302)
+    if not verify_session(clipnest_session):
+        return RedirectResponse("/login", status_code=302)
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "app_name": settings.app_name,
-            "default_token": settings.api_token if settings.api_token == "change-me" else "",
+        },
+    )
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, clipnest_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE_NAME)] = None):
+    setup_required = not db.auth_admin_configured()
+    if not setup_required and verify_session(clipnest_session):
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(
+        "login.html",
+        {
+            "request": request,
+            "app_name": settings.app_name,
+            "setup_required": setup_required,
         },
     )
 
 
 @app.get("/api/session", dependencies=[Depends(require_token)])
 async def session_status():
-    return {"authenticated": True, "max_age": SESSION_MAX_AGE_SECONDS}
+    admin = db.get_auth_admin()
+    return {
+        "authenticated": True,
+        "setup_required": admin is None,
+        "username": admin["username"] if admin else "",
+        "max_age": SESSION_MAX_AGE_SECONDS,
+    }
+
+
+@app.post("/api/setup")
+async def setup_admin(payload: SetupCreate, response: Response):
+    if db.auth_admin_configured():
+        raise HTTPException(status_code=409, detail="Admin account already exists")
+    username = normalize_auth_username(payload.username)
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="Passwords do not match")
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    admin = db.set_auth_admin(username, hash_password(payload.password))
+    create_session_cookie(response, admin)
+    return {"authenticated": True, "username": admin["username"], "max_age": SESSION_MAX_AGE_SECONDS}
 
 
 @app.post("/api/session")
 async def create_session(payload: SessionCreate, response: Response):
-    if settings.api_token and payload.token != settings.api_token:
-        raise HTTPException(status_code=401, detail="Invalid API token")
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=sign_session(),
-        max_age=SESSION_MAX_AGE_SECONDS,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        path="/",
-    )
-    return {"authenticated": True, "max_age": SESSION_MAX_AGE_SECONDS}
+    admin = db.get_auth_admin()
+    if not admin:
+        raise HTTPException(status_code=409, detail="Admin account has not been initialized")
+    username = normalize_auth_username(payload.username)
+    if not hmac.compare_digest(username, admin["username"]) or not verify_password(payload.password, admin["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    create_session_cookie(response, admin)
+    return {"authenticated": True, "username": admin["username"], "max_age": SESSION_MAX_AGE_SECONDS}
 
 
 @app.delete("/api/session")
@@ -642,6 +772,39 @@ async def parse_preview(payload: ParsePreviewCreate):
         if parsed.get("type") == "video"
         else [{"value": "best", "label": "全部图片", "resolution": "", "fps": 0, "codec": "image", "bit_rate": 0, "data_size": 0}],
     }
+
+
+@app.get("/api/image-proxy", dependencies=[Depends(require_token)])
+async def image_proxy(url: str = Query(min_length=8, max_length=3000)):
+    clean = str(url or "").strip()
+    if clean.startswith("//"):
+        clean = f"https:{clean}"
+    parsed = urlsplit(clean)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid image URL")
+    if is_private_proxy_host(parsed.hostname or ""):
+        raise HTTPException(status_code=400, detail="Unsupported image host")
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            response = await client.get(clean, headers=image_proxy_headers(clean))
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Image request failed: HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Image request failed: {exc}") from exc
+    final_host = response.url.host or ""
+    if is_private_proxy_host(final_host):
+        raise HTTPException(status_code=400, detail="Unsupported image host")
+    content_type = response.headers.get("content-type", "image/jpeg").split(";", 1)[0].strip().lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=502, detail="Remote URL did not return an image")
+    if len(response.content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image is too large")
+    return Response(
+        content=response.content,
+        media_type=content_type or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=600"},
+    )
 
 
 @app.post("/api/jobs", dependencies=[Depends(require_token)])
@@ -785,26 +948,36 @@ async def resolve_author_sync_source_payload(payload: AuthorSyncSourceCreate | A
     values = payload.model_dump(exclude_unset=True)
     url = clean_url(str(values.get("url") or ""))
     sec_uid = str(values.get("sec_uid") or "").strip()
-    platform = str(values.get("platform") or "douyin").strip().lower() or "douyin"
-    if platform != "douyin":
-        raise HTTPException(status_code=400, detail="当前作者同步只支持抖音")
+    platform_value = str(values.get("platform") or "").strip().lower()
+    platform = platform_value or ("bilibili" if NativeBilibiliParserAdapter.is_author_url(url) else "douyin")
+    if platform not in {"douyin", "bilibili"}:
+        raise HTTPException(status_code=400, detail="当前作者同步支持抖音和哔哩哔哩")
     if url and not sec_uid:
-        direct = NativeDouyinParserAdapter.extract_sec_uid(url)
-        if direct and direct.lower() != "self":
-            sec_uid = direct
+        if platform == "bilibili":
+            sec_uid = NativeBilibiliParserAdapter.extract_mid(url)
         else:
-            parser_settings = db.get_parser_settings(include_secret=True)
-            crawler = NativeDouyinParserAdapter(parser_settings=parser_settings)
-            try:
-                sec_uid = await crawler.resolve_sec_uid(url)
-            except Exception as exc:
-                raise HTTPException(status_code=502, detail=f"解析作者主页失败：{exc}") from exc
+            direct = NativeDouyinParserAdapter.extract_sec_uid(url)
+            if direct and direct.lower() != "self":
+                sec_uid = direct
+            else:
+                parser_settings = db.get_parser_settings(include_secret=True)
+                crawler = NativeDouyinParserAdapter(parser_settings=parser_settings)
+                try:
+                    sec_uid = await crawler.resolve_sec_uid(url)
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"解析作者主页失败：{exc}") from exc
     if sec_uid and not url:
-        url = f"https://www.douyin.com/user/{sec_uid}"
+        url = (
+            f"https://space.bilibili.com/{sec_uid}/upload/video"
+            if platform == "bilibili"
+            else f"https://www.douyin.com/user/{sec_uid}"
+        )
     if not url and not sec_uid:
         raise HTTPException(status_code=400, detail="请填写作者主页链接或主页 ID")
+    if platform == "bilibili" and not sec_uid:
+        raise HTTPException(status_code=400, detail="请填写哔哩哔哩 UP 主空间链接，例如 https://space.bilibili.com/116683/upload/video")
     values["platform"] = platform
-    values["url"] = url
+    values["url"] = NativeBilibiliParserAdapter.canonical_author_url(sec_uid) if platform == "bilibili" else url
     values["sec_uid"] = sec_uid
     return values
 
@@ -814,7 +987,7 @@ async def list_author_sync_sources(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=24, ge=1, le=100),
     q: str | None = Query(default=None, max_length=120),
-    platform: str | None = Query(default="douyin", max_length=40),
+    platform: str | None = Query(default=None, max_length=40),
     enabled: bool | None = Query(default=None),
 ):
     return db.list_author_sync_sources(
@@ -920,8 +1093,14 @@ def author_sync_source_to_crawl(source: dict, sync_mode: str | None = None) -> d
     if existing:
         existing["reused"] = True
         return existing
+    platform = str(source.get("platform") or "").strip().lower()
+    fallback_url = (
+        f"https://space.bilibili.com/{source.get('sec_uid') or ''}/upload/video"
+        if platform == "bilibili"
+        else f"https://www.douyin.com/user/{source.get('sec_uid') or ''}"
+    )
     job = db.create_author_crawl_job(
-        str(source.get("url") or f"https://www.douyin.com/user/{source.get('sec_uid') or ''}"),
+        str(source.get("url") or fallback_url),
         max_items=int(source.get("max_items") or 200),
         max_pages=int(source.get("max_pages") or 80),
         delay_ms=int(source.get("delay_ms") or 600),
@@ -961,7 +1140,7 @@ async def crawl_author_sync_sources(payload: AuthorSyncBatchCrawl):
             page = db.list_author_sync_sources(
                 page=page_no,
                 page_size=100,
-                platform="douyin",
+                platform=None,
                 enabled=True if payload.enabled_only else None,
             )
             sources.extend(page.get("items") or [])

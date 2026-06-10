@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,27 @@ SEGMENTED_DOWNLOAD_ENABLED = False
 
 class DownloadCancelled(RuntimeError):
     pass
+
+
+def ffmpeg_executable() -> str | None:
+    configured = str(settings.ffmpeg_path or "ffmpeg").strip()
+    if not configured:
+        configured = "ffmpeg"
+    if os.path.isabs(configured) or os.path.dirname(configured):
+        return configured if os.path.exists(configured) else None
+    found = shutil.which(configured)
+    if found:
+        return found
+    if os.name != "nt" or configured.lower() not in {"ffmpeg", "ffmpeg.exe"}:
+        return None
+    for candidate in (
+        r"C:\Windows\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def sanitize_filename_part(value: Any, fallback: str) -> str:
@@ -127,6 +149,13 @@ def build_download_headers(payload: dict[str, Any], parser_settings: dict[str, A
         cookie = normalize_cookie_header(parser_settings.get("tiktok_cookie") or settings.tiktok_cookie or "")
         if cookie:
             headers["Cookie"] = cookie
+    elif platform == "bilibili":
+        headers["Referer"] = str((payload.get("video_data") or {}).get("source_url") or "https://www.bilibili.com/")
+        headers["Origin"] = "https://www.bilibili.com"
+        headers["User-Agent"] = str(parser_settings.get("bilibili_user_agent") or settings.bilibili_user_agent)
+        cookie = normalize_cookie_header(parser_settings.get("bilibili_cookie") or settings.bilibili_cookie or "")
+        if cookie:
+            headers["Cookie"] = cookie
     return headers
 
 
@@ -153,7 +182,8 @@ def build_video_download_headers(headers: dict[str, str]) -> dict[str, str]:
 def candidate_dimension(item: dict[str, Any]) -> tuple[int, int, int]:
     width = int(item.get("width") or 0)
     height = int(item.get("height") or 0)
-    shorter = min(width, height) if width and height else max(width, height)
+    quality_height = int(item.get("quality_height") or 0)
+    shorter = quality_height or (min(width, height) if width and height else max(width, height))
     longer = max(width, height)
     return width, height, shorter or longer
 
@@ -161,8 +191,8 @@ def candidate_dimension(item: dict[str, Any]) -> tuple[int, int, int]:
 def candidate_quality_score(item: dict[str, Any]) -> tuple[int, int, int, int, int]:
     width, height, shorter = candidate_dimension(item)
     return (
-        max(width, height),
         shorter,
+        max(width, height),
         int(bool(item.get("is_h265"))),
         int(item.get("data_size") or 0),
         int(item.get("bit_rate") or 0),
@@ -207,16 +237,19 @@ def ordered_bit_rate_candidates(
 def video_download_candidates(
     video_data: dict[str, Any],
     quality_preference: str | None = "best",
-) -> list[dict[str, str]]:
-    candidates: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     quality = db.normalize_quality_preference(quality_preference)
     for index, item in enumerate(ordered_bit_rate_candidates(video_data, quality)):
         width = int(item.get("width") or 0)
         height = int(item.get("height") or 0)
         fps = int(item.get("fps") or 0)
-        codec = "h265" if item.get("is_h265") else "h264"
-        label = f"bit-rate {width}x{height}"
+        codec = str(item.get("codec") or ("h265" if item.get("is_h265") else "h264"))
+        quality_label = str(item.get("quality_label") or item.get("gear_name") or "").strip()
+        label = quality_label or f"bit-rate {width}x{height}"
+        if width and height and quality_label:
+            label = f"{label} {width}x{height}"
         if fps:
             label = f"{label}@{fps}"
         label = f"{label} {codec}"
@@ -226,13 +259,21 @@ def video_download_candidates(
             if not url or url in seen:
                 continue
             suffix = "" if url_index == 0 else f" backup {url_index}"
-            candidates.append(
-                {
-                    "key": f"bit_rate_{quality}_{index}_{url_index}",
-                    "label": f"{label}{suffix}",
-                    "url": url,
-                }
-            )
+            candidate = {
+                "key": f"bit_rate_{quality}_{index}_{url_index}",
+                "label": f"{label}{suffix}",
+                "url": url,
+            }
+            if item.get("merge") == "dash" and item.get("audio_url"):
+                candidate.update(
+                    {
+                        "merge": "dash",
+                        "audio_url": item.get("audio_url"),
+                        "audio_back_urls": item.get("audio_back_urls") or [],
+                        "audio_bit_rate": item.get("audio_bit_rate") or 0,
+                    }
+                )
+            candidates.append(candidate)
             seen.add(url)
     ordered_keys = (
         ("nwm_video_url_HQ", "no-watermark HQ"),
@@ -292,7 +333,7 @@ def parse_content_range_total(value: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def bit_rate_group_index(candidate: dict[str, str]) -> int | None:
+def bit_rate_group_index(candidate: dict[str, Any]) -> int | None:
     match = re.match(r"bit_rate_[^_]+_(\d+)_\d+$", str(candidate.get("key") or ""))
     return int(match.group(1)) if match else None
 
@@ -324,7 +365,7 @@ async def probe_range_size(url: str, headers: dict[str, str]) -> dict[str, Any]:
             }
 
 
-async def probe_candidate_speed(candidate: dict[str, str], headers: dict[str, str], probe_bytes: int = 512 * 1024) -> dict[str, Any]:
+async def probe_candidate_speed(candidate: dict[str, Any], headers: dict[str, str], probe_bytes: int = 512 * 1024) -> dict[str, Any]:
     url = candidate["url"]
     probe_headers = build_video_download_headers(headers)
     probe_headers["Range"] = f"bytes=0-{probe_bytes - 1}"
@@ -352,11 +393,11 @@ async def probe_candidate_speed(candidate: dict[str, str], headers: dict[str, st
 
 
 async def reorder_candidates_by_probe(
-    candidates: list[dict[str, str]],
+    candidates: list[dict[str, Any]],
     headers: dict[str, str],
     job_id: int | None = None,
     limit: int = 6,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     if len(candidates) <= 1:
         return candidates
     first_group = bit_rate_group_index(candidates[0])
@@ -410,7 +451,7 @@ async def reorder_candidates_by_probe(
     return ranked_probe_targets + remaining
 
 
-def download_candidate_event_data(candidates: list[dict[str, str]], quality_preference: str | None) -> dict[str, Any]:
+def download_candidate_event_data(candidates: list[dict[str, Any]], quality_preference: str | None) -> dict[str, Any]:
     return {
         "count": len(candidates),
         "quality_preference": db.normalize_quality_preference(quality_preference),
@@ -419,6 +460,8 @@ def download_candidate_event_data(candidates: list[dict[str, str]], quality_pref
                 "key": candidate.get("key"),
                 "label": candidate.get("label"),
                 "host": safe_url_host(str(candidate.get("url") or "")),
+                "merge": candidate.get("merge") or "",
+                "audio_host": safe_url_host(str(candidate.get("audio_url") or "")),
             }
             for candidate in candidates[:12]
         ],
@@ -602,8 +645,158 @@ async def segmented_stream_to_file(
     }
 
 
+async def download_bilibili_dash_candidate(
+    candidate: dict[str, Any],
+    file_path: str,
+    headers: dict[str, str],
+    progress_cb,
+    update_cb,
+    cancel_check=None,
+) -> dict[str, Any]:
+    video_url = str(candidate.get("url") or "").strip()
+    audio_urls = [
+        str(url or "").strip()
+        for url in [candidate.get("audio_url"), *(candidate.get("audio_back_urls") or [])]
+        if str(url or "").strip()
+    ]
+    if not video_url or not audio_urls:
+        raise RuntimeError("DASH candidate is missing video or audio URL")
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        raise RuntimeError(
+            "ffmpeg is required to merge Bilibili DASH video and audio streams; "
+            "set CLIPNEST_FFMPEG_PATH if it is not on PATH"
+        )
+
+    video_path = f"{file_path}.video.m4s"
+    audio_path = f"{file_path}.audio.m4s"
+    output_part = f"{file_path}.merge.part.mp4"
+    for path in (video_path, audio_path, output_part):
+        if os.path.exists(path):
+            os.remove(path)
+
+    started_at = asyncio.get_running_loop().time()
+
+    async def video_progress(progress: float):
+        mapped = 20 + (max(20, min(95, progress)) - 20) * 0.52
+        await progress_cb(mapped)
+
+    async def audio_progress(progress: float):
+        mapped = 62 + (max(20, min(95, progress)) - 20) * 0.28
+        await progress_cb(mapped)
+
+    try:
+        video_headers = build_video_download_headers(headers)
+        await update_cb(
+            status="downloading",
+            progress=20,
+            message=f"Downloading video: {candidate.get('label')}",
+            file_path=file_path,
+        )
+        video_result = await stream_to_file(
+            video_url,
+            video_path,
+            video_progress,
+            headers=video_headers,
+            cancel_check=cancel_check,
+        )
+
+        audio_errors: list[str] = []
+        audio_result: dict[str, Any] | None = None
+        for audio_index, audio_url in enumerate(audio_urls):
+            audio_headers = build_video_download_headers(headers)
+            await update_cb(
+                status="downloading",
+                progress=62,
+                message=f"Downloading audio: {candidate.get('label')}",
+                file_path=file_path,
+            )
+            try:
+                audio_result = await stream_to_file(
+                    audio_url,
+                    audio_path,
+                    audio_progress,
+                    headers=audio_headers,
+                    cancel_check=cancel_check,
+                )
+                break
+            except DownloadCancelled:
+                raise
+            except Exception as exc:
+                audio_errors.append(f"audio backup {audio_index}: {type(exc).__name__}: {exc}")
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+        if audio_result is None:
+            raise RuntimeError("All DASH audio URLs failed: " + "; ".join(audio_errors))
+
+        if cancel_check and await cancel_check():
+            raise DownloadCancelled("Download cancelled")
+
+        await update_cb(
+            status="downloading",
+            progress=90,
+            message=f"Merging: {candidate.get('label')}",
+            file_path=file_path,
+        )
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                output_part,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if proc.returncode != 0:
+            output = ((proc.stderr or "") + (proc.stdout or "")).strip()
+            raise RuntimeError(f"ffmpeg merge failed: {output[:400]}")
+        os.replace(output_part, file_path)
+    except Exception:
+        for path in (video_path, audio_path, output_part):
+            if os.path.exists(path):
+                os.remove(path)
+        raise
+    finally:
+        for path in (video_path, audio_path, output_part):
+            if os.path.exists(path):
+                os.remove(path)
+
+    duration = max(0.001, asyncio.get_running_loop().time() - started_at)
+    bytes_total = os.path.getsize(file_path)
+    expected_total = int(video_result.get("expected_size_bytes") or 0) + int(audio_result.get("expected_size_bytes") or 0)
+    return {
+        "bytes": bytes_total,
+        "expected_size_bytes": expected_total or bytes_total,
+        "duration_seconds": round(duration, 3),
+        "speed_bytes_per_second": round((int(video_result.get("bytes") or 0) + int(audio_result.get("bytes") or 0)) / duration, 2),
+        "http_status": 200,
+        "content_range": "",
+        "range_segments": 2,
+        "merge": "dash",
+        "video_bytes": video_result.get("bytes"),
+        "audio_bytes": audio_result.get("bytes"),
+    }
+
+
 async def download_with_fallback(
-    candidates: list[dict[str, str]],
+    candidates: list[dict[str, Any]],
     file_path: str,
     headers: dict[str, str],
     progress_cb,
@@ -634,41 +827,61 @@ async def download_with_fallback(
                     "key": candidate.get("key"),
                     "label": label,
                     "host": safe_url_host(url),
+                    "merge": candidate.get("merge") or "",
+                    "audio_host": safe_url_host(str(candidate.get("audio_url") or "")),
                 },
             )
         try:
-            video_headers = build_video_download_headers(headers)
-            probe = await probe_range_size(url, video_headers) if SEGMENTED_DOWNLOAD_ENABLED else {}
-            if (
-                SEGMENTED_DOWNLOAD_ENABLED
-                and probe.get("range_supported")
-                and int(probe.get("total_size") or 0) >= 2 * 1024 * 1024
-            ):
-                try:
-                    result = await segmented_stream_to_file(
-                        url,
-                        file_path,
-                        progress_cb,
-                        headers=headers,
-                        total_size=int(probe["total_size"]),
-                        cancel_check=cancel_check,
-                    )
-                except DownloadCancelled:
-                    raise
-                except Exception as segment_exc:
-                    if job_id is not None:
-                        db.add_event(
-                            job_id,
-                            "download:segment_failed",
-                            f"Segmented download failed, falling back: {type(segment_exc).__name__}",
-                            {
-                                "attempt": index + 1,
-                                "key": candidate.get("key"),
-                                "label": label,
-                                "host": safe_url_host(url),
-                                "error": str(segment_exc)[:240],
-                            },
+            if candidate.get("merge") == "dash":
+                result = await download_bilibili_dash_candidate(
+                    candidate,
+                    file_path,
+                    headers,
+                    progress_cb,
+                    update_cb,
+                    cancel_check=cancel_check,
+                )
+            else:
+                video_headers = build_video_download_headers(headers)
+                probe = await probe_range_size(url, video_headers) if SEGMENTED_DOWNLOAD_ENABLED else {}
+                if (
+                    SEGMENTED_DOWNLOAD_ENABLED
+                    and probe.get("range_supported")
+                    and int(probe.get("total_size") or 0) >= 2 * 1024 * 1024
+                ):
+                    try:
+                        result = await segmented_stream_to_file(
+                            url,
+                            file_path,
+                            progress_cb,
+                            headers=headers,
+                            total_size=int(probe["total_size"]),
+                            cancel_check=cancel_check,
                         )
+                    except DownloadCancelled:
+                        raise
+                    except Exception as segment_exc:
+                        if job_id is not None:
+                            db.add_event(
+                                job_id,
+                                "download:segment_failed",
+                                f"Segmented download failed, falling back: {type(segment_exc).__name__}",
+                                {
+                                    "attempt": index + 1,
+                                    "key": candidate.get("key"),
+                                    "label": label,
+                                    "host": safe_url_host(url),
+                                    "error": str(segment_exc)[:240],
+                                },
+                            )
+                        result = await stream_to_file(
+                            url,
+                            file_path,
+                            progress_cb,
+                            headers=video_headers,
+                            cancel_check=cancel_check,
+                        )
+                else:
                     result = await stream_to_file(
                         url,
                         file_path,
@@ -676,14 +889,6 @@ async def download_with_fallback(
                         headers=video_headers,
                         cancel_check=cancel_check,
                     )
-            else:
-                result = await stream_to_file(
-                    url,
-                    file_path,
-                    progress_cb,
-                    headers=video_headers,
-                    cancel_check=cancel_check,
-                )
             if job_id is not None:
                 success_message = download_summary(label, result)
                 db.add_event(
@@ -706,6 +911,9 @@ async def download_with_fallback(
                         "range_segments": result.get("range_segments") or 1,
                         "range_concurrency": result.get("range_concurrency") or 1,
                         "range_segment_size": result.get("range_segment_size") or 0,
+                        "merge": result.get("merge") or "",
+                        "video_bytes": result.get("video_bytes") or 0,
+                        "audio_bytes": result.get("audio_bytes") or 0,
                     },
                 )
             return {
@@ -754,9 +962,12 @@ async def download_with_fallback(
 
 def inspect_media(file_path: str) -> dict[str, Any]:
     result = {"resolution": None, "codec": None, "duration_seconds": None}
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        return result
     try:
         proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", file_path],
+            [ffmpeg, "-hide_banner", "-i", file_path],
             capture_output=True,
             text=True,
             timeout=20,

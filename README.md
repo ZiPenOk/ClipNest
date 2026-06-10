@@ -1,12 +1,13 @@
 # ClipNest
 
-ClipNest 是一个面向家庭 Docker/NAS 的抖音下载和媒体库工具。它不是单纯的“解析链接下载器”，而是把抖音作品、图集、作者主页抓取、远程推送、Telegram 反向下载统一收进家里的媒体库。
+ClipNest 是一个面向家庭 Docker/NAS 的短视频下载和媒体库工具。它不是单纯的“解析链接下载器”，而是把抖音、TikTok、哔哩哔哩作品下载、作者主页抓取、远程推送、Telegram 反向下载统一收进家里的媒体库。
 
-当前项目只面向抖音，不包含 TikTok。
+作者同步目前只支持抖音；单作品下载支持抖音、TikTok 和哔哩哔哩。
 
 ## 主要功能
 
 - 抖音视频和图集解析下载
+- TikTok、哔哩哔哩单作品解析下载
 - 默认选择可用的最高画质，优先保留 H.265/HEVC 高画质候选
 - 单连接 Range 下载，接近浏览器行为，避免多线程分片带来的额外请求风险
 - 下载进度使用内存状态，SQL 只保存关键状态和最终结果
@@ -55,6 +56,9 @@ CLIPNEST_PORT=8090
 CLIPNEST_DOWNLOAD_DIR_HOST=/volume1/Nas/downloads/clipnest
 CLIPNEST_DOUYIN_COOKIE=
 CLIPNEST_DOUYIN_USER_AGENT=
+CLIPNEST_TIKTOK_COOKIE=
+CLIPNEST_BILIBILI_COOKIE=
+CLIPNEST_FFMPEG_PATH=
 ```
 
 启动：
@@ -118,6 +122,11 @@ docker compose up -d
 | `CLIPNEST_PARSER_ADAPTER` | 解析器 | `native_douyin` |
 | `CLIPNEST_DOUYIN_COOKIE` | 抖音 Cookie，可留空后在设置页填写 | 空 |
 | `CLIPNEST_DOUYIN_USER_AGENT` | 抖音请求 User-Agent | 内置默认值 |
+| `CLIPNEST_TIKTOK_COOKIE` | TikTok Cookie，可留空后在设置页填写 | 空 |
+| `CLIPNEST_TIKTOK_USER_AGENT` | TikTok 请求 User-Agent | 内置默认值 |
+| `CLIPNEST_BILIBILI_COOKIE` | 哔哩哔哩 Cookie，可留空后在设置页填写 | 空 |
+| `CLIPNEST_BILIBILI_USER_AGENT` | 哔哩哔哩请求 User-Agent | 内置默认值 |
+| `CLIPNEST_FFMPEG_PATH` | ffmpeg 可执行文件路径，留空/默认使用 `ffmpeg` | `ffmpeg` |
 | `CLIPNEST_PUBLIC_BASE_URL` | 外部访问地址，可选 | 空 |
 
 设置页保存的配置会覆盖 `.env` 默认值。Cookie 和 Telegram Bot Token 属于写入型配置，保存后不会回显到浏览器。
@@ -197,7 +206,7 @@ tools/clipnest-douyin-push.user.js
 
 配置完成后，可以直接给机器人发送：
 
-- 抖音作品链接：创建单个下载任务
+- 抖音、TikTok、哔哩哔哩作品链接：创建单个下载任务
 - 抖音作者主页链接：创建作者抓取任务，后台抓取作者作品并加入下载队列
 - `/status`：查看当前下载任务和作者抓取任务
 - `/help`：查看简短说明
@@ -297,6 +306,8 @@ ClipNest 内置本地 A-Bogus 签名，不依赖外部解析 API 或外部签名
 ```text
 app/vendor/F2_ABOGUS_LICENSE
 ```
+
+哔哩哔哩下载使用官方 Web 接口解析 BV/AV 单视频，DASH 音视频分离流会通过 `ffmpeg` 合并为 MP4。Docker 镜像内置 `ffmpeg`；本机裸跑如果服务进程读不到 PATH，可以设置 `CLIPNEST_FFMPEG_PATH` 为 `ffmpeg.exe` 完整路径。未配置 Cookie 时公开视频通常可下载，登录/会员/高画质内容需要在设置页或 `.env` 配置哔哩哔哩 Cookie。
 
 ## 注意
 

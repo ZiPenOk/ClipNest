@@ -32,9 +32,11 @@ DEFAULT_PARSER_SETTINGS: dict[str, Any] = {
     "douyin_user_agent": settings.douyin_user_agent,
     "tiktok_cookie": settings.tiktok_cookie,
     "tiktok_user_agent": settings.tiktok_user_agent,
+    "bilibili_cookie": settings.bilibili_cookie,
+    "bilibili_user_agent": settings.bilibili_user_agent,
     "douyin_signer_kind": "local_abogus",
 }
-PARSER_ADAPTERS = {"native_douyin", "native_douyin_share", "native_tiktok"}
+PARSER_ADAPTERS = {"native_douyin", "native_douyin_share", "native_tiktok", "native_bilibili"}
 PARSE_CACHE_TTL_SECONDS = 10 * 60
 QUALITY_ALIASES = {
     "最高": "best",
@@ -485,6 +487,11 @@ def normalize_parser_settings(values: dict[str, Any]) -> dict[str, Any]:
     if "tiktok_user_agent" in values:
         tiktok_user_agent = str(values["tiktok_user_agent"] or "").strip()
         normalized["tiktok_user_agent"] = (tiktok_user_agent or settings.tiktok_user_agent)[:500]
+    if "bilibili_cookie" in values:
+        normalized["bilibili_cookie"] = normalize_cookie_header(values["bilibili_cookie"])[:20000]
+    if "bilibili_user_agent" in values:
+        bilibili_user_agent = str(values["bilibili_user_agent"] or "").strip()
+        normalized["bilibili_user_agent"] = (bilibili_user_agent or settings.bilibili_user_agent)[:500]
     return normalized
 
 
@@ -510,10 +517,64 @@ def get_public_app_settings() -> dict[str, Any]:
     return result
 
 
+def get_auth_admin() -> dict[str, str] | None:
+    values: dict[str, str] = {}
+    try:
+        with connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT key, value_json
+                FROM app_settings
+                WHERE key IN ('auth_admin_username', 'auth_admin_password_hash')
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    for row in rows:
+        try:
+            values[row["key"]] = str(json.loads(row["value_json"]) or "")
+        except json.JSONDecodeError:
+            continue
+    username = values.get("auth_admin_username", "").strip()
+    password_hash = values.get("auth_admin_password_hash", "").strip()
+    if not username or not password_hash:
+        return None
+    return {"username": username, "password_hash": password_hash}
+
+
+def auth_admin_configured() -> bool:
+    return get_auth_admin() is not None
+
+
+def set_auth_admin(username: str, password_hash: str) -> dict[str, str]:
+    clean_username = str(username or "").strip()[:80]
+    clean_hash = str(password_hash or "").strip()
+    if not clean_username or not clean_hash:
+        raise ValueError("Username and password hash are required")
+    now = utc_now()
+    with connect() as conn:
+        for key, value in {
+            "auth_admin_username": clean_username,
+            "auth_admin_password_hash": clean_hash,
+        }.items():
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(value, ensure_ascii=False), now),
+            )
+    return {"username": clean_username, "password_hash": clean_hash}
+
+
 def get_parser_settings(include_secret: bool = False) -> dict[str, Any]:
     result = dict(DEFAULT_PARSER_SETTINGS)
     stored_cookie = ""
     stored_tiktok_cookie = ""
+    stored_bilibili_cookie = ""
     try:
         with connect() as conn:
             rows = conn.execute("SELECT key, value_json FROM app_settings").fetchall()
@@ -531,6 +592,8 @@ def get_parser_settings(include_secret: bool = False) -> dict[str, Any]:
             stored_cookie = str(value or "")
         if row["key"] == "tiktok_cookie":
             stored_tiktok_cookie = str(value or "")
+        if row["key"] == "bilibili_cookie":
+            stored_bilibili_cookie = str(value or "")
     if result.get("parser_adapter") not in PARSER_ADAPTERS:
         result["parser_adapter"] = settings.parser_adapter
     result["douyin_signer_kind"] = "local_abogus"
@@ -543,6 +606,10 @@ def get_parser_settings(include_secret: bool = False) -> dict[str, Any]:
         result["tiktok_cookie"] = ""
         result["tiktok_cookie_configured"] = bool(configured_tiktok_cookie)
         result["tiktok_cookie_source"] = "database" if stored_tiktok_cookie else ("environment" if settings.tiktok_cookie else "none")
+        configured_bilibili_cookie = str(result.get("bilibili_cookie") or "")
+        result["bilibili_cookie"] = ""
+        result["bilibili_cookie_configured"] = bool(configured_bilibili_cookie)
+        result["bilibili_cookie_source"] = "database" if stored_bilibili_cookie else ("environment" if settings.bilibili_cookie else "none")
     return result
 
 
@@ -829,7 +896,7 @@ def sync_source_payload(values: dict[str, Any], existing: dict[str, Any] | None 
     source = existing or {}
     mode = normalize_author_crawl_mode(values.get("sync_mode", source.get("sync_mode") or "incremental"))
     platform = str(values.get("platform", source.get("platform") or "douyin") or "douyin").strip().lower()
-    if platform not in {"douyin", "tiktok"}:
+    if platform not in {"douyin", "tiktok", "bilibili"}:
         platform = "douyin"
     return {
         "platform": platform,
@@ -921,7 +988,11 @@ def upsert_author_sync_source(values: dict[str, Any]) -> dict[str, Any]:
         )
     payload = sync_source_payload(values, existing)
     if not payload["url"] and payload["sec_uid"]:
-        payload["url"] = f"https://www.douyin.com/user/{payload['sec_uid']}"
+        payload["url"] = (
+            f"https://space.bilibili.com/{payload['sec_uid']}/upload/video"
+            if payload["platform"] == "bilibili"
+            else f"https://www.douyin.com/user/{payload['sec_uid']}"
+        )
     if not payload["url"]:
         raise ValueError("同步源需要作者主页链接或主页 ID")
     if not payload["author_name"] and payload["sec_uid"]:
@@ -1456,8 +1527,11 @@ def update_author_sync_source_from_crawl(
         if source_id:
             source = conn.execute("SELECT * FROM author_sync_sources WHERE id = ?", (source_id,)).fetchone()
         if not source:
+            source_platform = str((source or {}).get("platform") or "").strip().lower()
+            if not source_platform:
+                source_platform = "bilibili" if "space.bilibili.com" in str(crawl["url"] or "") else "douyin"
             found = find_author_sync_source(
-                platform="douyin",
+                platform=source_platform,
                 sec_uid=crawl["sec_uid"],
                 author_name=crawl["author_name"],
                 url=crawl["url"],
@@ -2246,7 +2320,7 @@ def attach_author_assets(
         author["cover_url"] = latest["cover_url"] if latest else ""
         author["cover_path"] = relative_asset_path(latest["cover_path"] if latest else "")
         author["sec_uid"] = author_sec_uid_from_history(conn, author["author"], metadata, platform=clean_platform or None)
-        sync = latest_author_crawl_for(conn, author["author"], author["sec_uid"]) if clean_platform in {"", "douyin"} else {}
+        sync = latest_author_crawl_for(conn, author["author"], author["sec_uid"])
         author["last_sync_at"] = sync.get("finished_at") or sync.get("updated_at") or sync.get("created_at") or ""
         author["last_sync_status"] = sync.get("status") or ""
         author["last_sync_created_count"] = sync.get("created_count") or 0

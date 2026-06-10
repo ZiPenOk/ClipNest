@@ -1,6 +1,6 @@
 const state = {
-  token: localStorage.getItem("clipnest-token") || document.querySelector("#token").value || "",
   authenticated: false,
+  username: "",
   currentView: ["dashboard", "library", "sync", "tasks", "logs", "settings"].includes(sessionStorage.getItem("clipnest-view"))
     ? sessionStorage.getItem("clipnest-view")
     : "dashboard",
@@ -63,7 +63,7 @@ const state = {
   libraryMode: ["authors", "media", "records"].includes(localStorage.getItem("clipnest-library-mode"))
     ? localStorage.getItem("clipnest-library-mode")
     : "authors",
-  libraryPlatform: ["", "douyin", "tiktok"].includes(localStorage.getItem("clipnest-library-platform") || "")
+  libraryPlatform: ["", "douyin", "tiktok", "bilibili"].includes(localStorage.getItem("clipnest-library-platform") || "")
     ? (localStorage.getItem("clipnest-library-platform") || "")
     : "",
   libraryAuthor: "",
@@ -108,8 +108,6 @@ const tasksPageSize = 15;
 const authorMaxItemsStorageKey = "clipnest-author-max-items";
 const authorCrawlPageSize = 18;
 
-const tokenInput = document.querySelector("#token");
-const loginPanelEl = document.querySelector("#login-panel");
 const sessionStatusEl = document.querySelector("#session-status");
 const logoutButton = document.querySelector("#logout");
 const urlsInput = document.querySelector("#urls");
@@ -288,6 +286,8 @@ const settingDouyinCookie = document.querySelector("#setting-douyin-cookie");
 const settingDouyinCookieStatus = document.querySelector("#setting-douyin-cookie-status");
 const settingTikTokCookie = document.querySelector("#setting-tiktok-cookie");
 const settingTikTokCookieStatus = document.querySelector("#setting-tiktok-cookie-status");
+const settingBilibiliCookie = document.querySelector("#setting-bilibili-cookie");
+const settingBilibiliCookieStatus = document.querySelector("#setting-bilibili-cookie-status");
 const settingDouyinUserAgent = document.querySelector("#setting-douyin-user-agent");
 const parserInfoEl = document.querySelector("#parser-info");
 const parserHealthButton = document.querySelector("#parser-health");
@@ -309,7 +309,9 @@ const qualityDialogEl = document.querySelector("#quality-dialog");
 const qualityCloseButton = document.querySelector("#quality-close");
 const qualityPlatformEl = document.querySelector("#quality-platform");
 const qualityTitleEl = document.querySelector("#quality-title");
+const qualityCoverWrapEl = document.querySelector("#quality-cover-wrap");
 const qualityCoverEl = document.querySelector("#quality-cover");
+const qualityCoverPlaceholderEl = document.querySelector("#quality-cover-placeholder");
 const qualityAuthorEl = document.querySelector("#quality-author");
 const qualityVideoIdEl = document.querySelector("#quality-video-id");
 const qualityOptionsEl = document.querySelector("#quality-options");
@@ -327,12 +329,8 @@ const statusLabels = {
 };
 let logsSearchTimer = null;
 
-tokenInput.value = state.token;
-
 function headers() {
-  const values = { "Content-Type": "application/json" };
-  if (state.token) values["X-Api-Token"] = state.token;
-  return values;
+  return { "Content-Type": "application/json" };
 }
 
 async function api(path, options = {}) {
@@ -417,14 +415,50 @@ function crawlStatusLabel(status) {
 }
 
 function mediaUrl(job, field) {
-  const tokenQuery = state.token ? `?token=${encodeURIComponent(state.token)}` : "";
-  return `/api/jobs/${job.id}/${field}${tokenQuery}`;
+  return `/api/jobs/${job.id}/${field}`;
 }
 
 function assetUrl(path) {
   const cleanPath = String(path || "").split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  const tokenQuery = state.token ? `?token=${encodeURIComponent(state.token)}` : "";
-  return cleanPath ? `/api/assets/${cleanPath}${tokenQuery}` : "";
+  return cleanPath ? `/api/assets/${cleanPath}` : "";
+}
+
+function normalizeImageUrl(url) {
+  const value = String(url || "").trim();
+  if (!value) return "";
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("http://")) return `https://${value.slice("http://".length)}`;
+  return value;
+}
+
+function proxiedImageUrl(url) {
+  const normalized = normalizeImageUrl(url);
+  if (!normalized) return "";
+  const params = new URLSearchParams({ url: normalized });
+  return `/api/image-proxy?${params.toString()}`;
+}
+
+function setQualityCover(url, title = "") {
+  const proxied = proxiedImageUrl(url);
+  qualityCoverEl.onload = null;
+  qualityCoverEl.onerror = null;
+  qualityCoverEl.removeAttribute("src");
+  qualityCoverEl.alt = title ? `${title} 封面` : "作品封面";
+  qualityCoverEl.hidden = true;
+  qualityCoverWrapEl.dataset.state = proxied ? "loading" : "empty";
+  qualityCoverPlaceholderEl.textContent = proxied ? "封面加载中" : "暂无封面";
+  if (!proxied) return;
+  qualityCoverEl.onload = () => {
+    qualityCoverWrapEl.dataset.state = "ready";
+    qualityCoverEl.hidden = false;
+  };
+  qualityCoverEl.onerror = () => {
+    qualityCoverWrapEl.dataset.state = "error";
+    qualityCoverEl.hidden = true;
+    qualityCoverEl.removeAttribute("src");
+    qualityCoverPlaceholderEl.textContent = "封面加载失败";
+  };
+  qualityCoverEl.src = proxied;
 }
 
 function clearLibraryMediaCache() {
@@ -434,6 +468,18 @@ function clearLibraryMediaCache() {
 
 function cleanUrl(value) {
   return String(value || "").trim().replace(/[.,;)\uFF0C\u3002\uFF1B]+$/g, "");
+}
+
+function platformFromUrl(url) {
+  const value = String(url || "").trim().toLowerCase();
+  try {
+    const host = new URL(value).hostname;
+    if (host === "bilibili.com" || host.endsWith(".bilibili.com") || host === "b23.tv" || host.endsWith(".b23.tv")) return "bilibili";
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) return "tiktok";
+    if (host === "douyin.com" || host.endsWith(".douyin.com") || host === "iesdouyin.com" || host.endsWith(".iesdouyin.com")) return "douyin";
+  } catch (_) {}
+  if (value.includes("space.bilibili.com")) return "bilibili";
+  return "douyin";
 }
 
 async function copyText(value) {
@@ -470,8 +516,9 @@ function extractUrls(text) {
 }
 
 function renderSession() {
-  sessionStatusEl.textContent = state.authenticated ? "已登录" : "未登录";
-  loginPanelEl.hidden = state.authenticated;
+  sessionStatusEl.textContent = state.authenticated
+    ? (state.username ? `已登录：${state.username}` : "已登录")
+    : "未登录";
   logoutButton.hidden = !state.authenticated;
 }
 
@@ -524,7 +571,7 @@ function setLibraryMode(mode) {
 }
 
 function setLibraryPlatform(platform) {
-  state.libraryPlatform = ["douyin", "tiktok"].includes(platform) ? platform : "";
+  state.libraryPlatform = ["douyin", "tiktok", "bilibili"].includes(platform) ? platform : "";
   localStorage.setItem("clipnest-library-platform", state.libraryPlatform);
   state.libraryAuthor = "";
   state.libraryAuthorDetail = null;
@@ -538,23 +585,17 @@ function setLibraryPlatform(platform) {
 async function checkSession() {
   const response = await fetch("/api/session", { credentials: "same-origin" });
   state.authenticated = response.ok;
+  if (response.ok) {
+    const result = await response.json();
+    state.username = result.username || "";
+  } else {
+    state.username = "";
+    if (response.status === 401 || response.status === 403) {
+      window.location.href = "/login";
+    }
+  }
   renderSession();
   return state.authenticated;
-}
-
-async function loginWithToken(token) {
-  const response = await fetch("/api/session", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token }),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  state.authenticated = true;
-  state.token = "";
-  tokenInput.value = "";
-  localStorage.removeItem("clipnest-token");
-  renderSession();
 }
 
 function renderStats(stats) {
@@ -1736,7 +1777,7 @@ function renderSyncAuthors() {
         </div>
         <div class="sync-author-actions">
           <button class="secondary" type="button" data-sync-source-detail="${item.id}">详情</button>
-          <button class="secondary" type="button" data-sync-author="${escapeHtml(author)}">查看作品</button>
+          <button class="secondary" type="button" data-sync-author="${escapeHtml(author)}" data-sync-source-id="${item.id}">查看作品</button>
           <button class="secondary" type="button" data-sync-source-toggle="${item.id}">${item.enabled ? "停用" : "启用"}</button>
           <button class="secondary" type="button" data-sync-source-run="${item.id}" data-sync-source-mode="incremental" ${canSync && item.enabled ? "" : "disabled"}>增量</button>
           <button type="button" data-sync-source-run="${item.id}" data-sync-source-mode="full" ${canSync && item.enabled ? "" : "disabled"}>全量</button>
@@ -1839,6 +1880,7 @@ function platformLabel(value) {
   if (!platform) return "全部";
   if (platform === "douyin") return "抖音";
   if (platform === "tiktok") return "TikTok";
+  if (platform === "bilibili") return "哔哩哔哩";
   if (platform === "unknown") return "未知";
   return value || "未知";
 }
@@ -2033,6 +2075,7 @@ function authorCrawlJobsHtml(crawls) {
     const canContinue = job.status === "finished" && Number(job.cursor || 0) > 0 && String(job.message || "").includes("更多");
     const authorName = String(job.author_name || "").trim();
     const modeLabel = job.sync_mode === "incremental" ? "增量" : "全量";
+    const platform = platformFromUrl(job.url || "");
     const identity = authorName ? `作者：${authorName}` : `主页 ID：${job.sec_uid || job.url || "-"}`;
     const actions = [];
     if (canPause) actions.push(`<button class="secondary" type="button" data-author-crawl-action="pause" data-author-crawl-id="${job.id}">暂停</button>`);
@@ -2042,7 +2085,7 @@ function authorCrawlJobsHtml(crawls) {
     return `
       <article class="author-crawl-job ${escapeHtml(job.status || "")}">
         <div>
-          <strong>#${job.id} / ${escapeHtml(crawlStatusLabel(job.status))} / ${modeLabel}${authorName ? ` / ${escapeHtml(authorName)}` : ""}</strong>
+          <strong>#${job.id} / ${escapeHtml(platformLabel(platform))} / ${escapeHtml(crawlStatusLabel(job.status))} / ${modeLabel}${authorName ? ` / ${escapeHtml(authorName)}` : ""}</strong>
           <span>${escapeHtml(identity)}</span>
           ${job.sec_uid && authorName ? `<span>主页 ID：${escapeHtml(job.sec_uid)}</span>` : ""}
           <span>发现 ${Number(job.found_count || 0)} / 新增 ${Number(job.created_count || 0)} / 已存在 ${Number(job.reused_count || 0)} / 页 ${Number(job.pages_scanned || 0)}</span>
@@ -2112,13 +2155,7 @@ function renderQualityDialog(preview, action = { type: "create" }) {
   qualityTitleEl.textContent = action.title || preview.title || "选择清晰度";
   qualityAuthorEl.textContent = preview.author_name || "Unknown";
   qualityVideoIdEl.textContent = preview.url || "";
-  if (preview.cover_url) {
-    qualityCoverEl.src = preview.cover_url;
-    qualityCoverEl.hidden = false;
-  } else {
-    qualityCoverEl.removeAttribute("src");
-    qualityCoverEl.hidden = true;
-  }
+  setQualityCover(preview.cover_url, preview.title || "");
   const options = preview.qualities && preview.qualities.length
     ? preview.qualities
     : [{ value: "best", label: "最高" }];
@@ -2676,6 +2713,10 @@ function renderParserSettings(values) {
   settingTikTokCookieStatus.textContent = values.tiktok_cookie_configured
     ? `Cookie 已配置：${values.tiktok_cookie_source || "database"}`
     : "Cookie 未配置";
+  settingBilibiliCookie.value = "";
+  settingBilibiliCookieStatus.textContent = values.bilibili_cookie_configured
+    ? `Cookie 已配置：${values.bilibili_cookie_source || "database"}`
+    : "Cookie 未配置";
   settingDouyinUserAgent.value = values.douyin_user_agent || "";
 }
 
@@ -2859,7 +2900,6 @@ async function loadSyncPage() {
     const params = new URLSearchParams({
       page: String(state.syncAuthorsPage),
       page_size: String(syncPageSize()),
-      platform: "douyin",
     });
     if (state.syncSearch) params.set("q", state.syncSearch);
     if (state.syncEnabledFilter === "enabled") params.set("enabled", "true");
@@ -3067,6 +3107,8 @@ async function saveSettings() {
   if (cookie) parserPayload.douyin_cookie = cookie;
   const tiktokCookie = settingTikTokCookie.value.trim();
   if (tiktokCookie) parserPayload.tiktok_cookie = tiktokCookie;
+  const bilibiliCookie = settingBilibiliCookie.value.trim();
+  if (bilibiliCookie) parserPayload.bilibili_cookie = bilibiliCookie;
   try {
     setSettingsBusy(true);
     settingsSaveStatus.textContent = "正在保存设置";
@@ -3675,31 +3717,12 @@ libraryDeleteSelectedButton.addEventListener("click", () => {
 });
 tasksRefreshButton.addEventListener("click", refreshTasksInPlace);
 
-document.querySelector("#login").addEventListener("click", async () => {
-  const token = tokenInput.value.trim();
-  if (!token) {
-    summaryEl.textContent = "请输入 API Token";
-    return;
-  }
-  try {
-    await loginWithToken(token);
-    summaryEl.textContent = "已登录";
-    refresh();
-  } catch (error) {
-    summaryEl.textContent = error.message || "登录失败";
-  }
-});
-
 logoutButton.addEventListener("click", async () => {
   await fetch("/api/session", { method: "DELETE", credentials: "same-origin" });
   state.authenticated = false;
+  state.username = "";
   renderSession();
-  summaryEl.textContent = "已退出";
-  refresh();
-});
-
-tokenInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") document.querySelector("#login").click();
+  window.location.href = "/login";
 });
 
 submitButton.addEventListener("click", async () => {
@@ -4196,7 +4219,7 @@ syncSourceAddButton.addEventListener("click", async () => {
       body: JSON.stringify({
         url,
         author_name: authorName,
-        platform: "douyin",
+        platform: platformFromUrl(url),
         enabled: true,
         sync_mode: "incremental",
         max_items: maxItems,
@@ -4244,7 +4267,9 @@ syncAuthorsEl.addEventListener("click", async (event) => {
   }
   const viewButton = event.target.closest("[data-sync-author]");
   if (viewButton) {
-    setLibraryPlatform("douyin");
+    const sourceId = Number(viewButton.dataset.syncSourceId || 0);
+    const source = state.syncSources.find((item) => Number(item.id) === sourceId) || {};
+    setLibraryPlatform(source.platform || "douyin");
     state.libraryAuthor = viewButton.dataset.syncAuthor || "";
     setLibraryMode("media");
     state.librarySort = "publish_desc";
@@ -4903,8 +4928,7 @@ maintenanceExportButton.addEventListener("click", async () => {
 });
 
 maintenanceBackupButton.addEventListener("click", () => {
-  const tokenQuery = state.token ? `?token=${encodeURIComponent(state.token)}` : "";
-  window.open(`/api/maintenance/backup${tokenQuery}`, "_blank");
+  window.open("/api/maintenance/backup", "_blank");
 });
 
 maintenanceCacheAssetsButton.addEventListener("click", async () => {
@@ -4982,16 +5006,7 @@ document.addEventListener("keydown", (event) => {
 async function bootstrap() {
   setView(state.currentView);
   const sessionOk = await checkSession();
-  if (!sessionOk && state.token) {
-    try {
-      await loginWithToken(state.token);
-      summaryEl.textContent = "已登录";
-    } catch (_) {
-      state.authenticated = false;
-      renderSession();
-    }
-  }
-  refresh();
+  if (sessionOk) refresh();
 }
 
 setInterval(refresh, 2500);

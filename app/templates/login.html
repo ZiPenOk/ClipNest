@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} 登录</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260610-auth" />
+  </head>
+  <body class="auth-page" data-setup-required="{{ 'true' if setup_required else 'false' }}">
+    <main class="auth-shell">
+      <section class="auth-panel" aria-labelledby="auth-title">
+        <div class="auth-brand">
+          <strong id="auth-title">{{ app_name }}</strong>
+          <span id="auth-mode-label">{{ '初始化管理员' if setup_required else '控制台登录' }}</span>
+        </div>
+        <form id="auth-form" class="auth-form" autocomplete="on">
+          <div class="auth-field">
+            <label for="auth-username">用户名</label>
+            <input id="auth-username" name="username" type="text" autocomplete="username" minlength="3" maxlength="80" required autofocus />
+          </div>
+          <div class="auth-field">
+            <label for="auth-password">密码</label>
+            <input id="auth-password" name="password" type="password" autocomplete="{{ 'new-password' if setup_required else 'current-password' }}" minlength="{{ 8 if setup_required else 1 }}" maxlength="200" required />
+          </div>
+          <div class="auth-field" id="auth-confirm-field" {% if not setup_required %}hidden{% endif %}>
+            <label for="auth-confirm-password">确认密码</label>
+            <input id="auth-confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="8" maxlength="200" {% if setup_required %}required{% endif %} />
+          </div>
+          <p id="auth-error" class="auth-error" role="alert" hidden></p>
+          <button id="auth-submit" type="submit">{{ '初始化并进入' if setup_required else '登录' }}</button>
+        </form>
+      </section>
+    </main>
+    <script src="/static/login.js?v=20260610-auth"></script>
+  </body>
+</html>

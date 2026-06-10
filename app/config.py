@@ -8,6 +8,7 @@ DEFAULT_DOUYIN_USER_AGENT = (
     "Chrome/130.0.0.0 Safari/537.36"
 )
 DEFAULT_TIKTOK_USER_AGENT = DEFAULT_DOUYIN_USER_AGENT
+DEFAULT_BILIBILI_USER_AGENT = DEFAULT_DOUYIN_USER_AGENT
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -57,6 +58,9 @@ class Settings:
     douyin_user_agent: str = os.getenv("CLIPNEST_DOUYIN_USER_AGENT") or DEFAULT_DOUYIN_USER_AGENT
     tiktok_cookie: str = os.getenv("CLIPNEST_TIKTOK_COOKIE", "")
     tiktok_user_agent: str = os.getenv("CLIPNEST_TIKTOK_USER_AGENT") or DEFAULT_TIKTOK_USER_AGENT
+    bilibili_cookie: str = os.getenv("CLIPNEST_BILIBILI_COOKIE", "")
+    bilibili_user_agent: str = os.getenv("CLIPNEST_BILIBILI_USER_AGENT") or DEFAULT_BILIBILI_USER_AGENT
+    ffmpeg_path: str = os.getenv("CLIPNEST_FFMPEG_PATH", "ffmpeg")
     worker_enabled: bool = env_bool("CLIPNEST_WORKER_ENABLED", True)
     public_base_url: str = os.getenv("CLIPNEST_PUBLIC_BASE_URL", "")
     poll_interval_seconds: float = float(os.getenv("CLIPNEST_POLL_INTERVAL_SECONDS", "2"))

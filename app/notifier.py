@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import db
+
+PLATFORM_LABELS = {
+    "douyin": "抖音",
+    "tiktok": "TikTok",
+    "bilibili": "哔哩哔哩",
+    "unknown": "未知",
+}
 
 
 def enabled(settings: dict[str, Any], event: str) -> bool:
@@ -21,6 +29,25 @@ def enabled(settings: dict[str, Any], event: str) -> bool:
 
 def job_title(job: dict[str, Any]) -> str:
     return str(job.get("title") or job.get("description") or job.get("url") or f"#{job.get('id')}")
+
+
+def platform_from_url(url: Any) -> str:
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+    if host == "bilibili.com" or host.endswith(".bilibili.com") or host == "b23.tv" or host.endswith(".b23.tv"):
+        return "bilibili"
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        return "tiktok"
+    if host == "douyin.com" or host.endswith(".douyin.com") or host == "iesdouyin.com" or host.endswith(".iesdouyin.com"):
+        return "douyin"
+    return ""
+
+
+def platform_text(value: Any, url: Any = "") -> str:
+    platform = str(value or "").strip().lower() or platform_from_url(url)
+    return PLATFORM_LABELS.get(platform, platform or "未知")
 
 
 def fmt_bytes(value: Any) -> str:
@@ -65,6 +92,7 @@ def telegram_text(job: dict[str, Any], event: str) -> str:
             "✅ ClipNest 下载完成",
             "",
             f"🎬 标题：{job_title(job)}",
+            f"🏷️ 平台：{platform_text(job.get('platform'), job.get('url'))}",
             f"👤 作者：{job.get('author_name') or 'Unknown'}",
             f"🎞️ 清晰度：{quality_text(job)}",
         ]
@@ -85,6 +113,7 @@ def telegram_text(job: dict[str, Any], event: str) -> str:
         "❌ ClipNest 下载失败",
         "",
         f"🎬 标题：{job_title(job)}",
+        f"🏷️ 平台：{platform_text(job.get('platform'), job.get('url'))}",
         f"👤 作者：{job.get('author_name') or 'Unknown'}",
         f"⚠️ 类型：{job.get('error_type') or 'unknown'}",
     ]

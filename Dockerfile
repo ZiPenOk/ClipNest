@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY tools ./tools
 
 ENV CLIPNEST_DATA_DIR=/data
 ENV CLIPNEST_DOWNLOAD_DIR=/downloads

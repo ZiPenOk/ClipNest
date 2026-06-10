@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260605-15" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260610-auth" />
   </head>
   <body>
     <div class="app-shell">
@@ -34,11 +34,6 @@
             <button id="logout" class="secondary" title="Logout" type="button">退出</button>
           </div>
         </header>
-
-        <section class="login-panel" id="login-panel">
-          <input id="token" type="password" placeholder="API token" value="{{ default_token }}" />
-          <button id="login" title="Login" type="button">登录</button>
-        </section>
 
         <p class="summary" id="summary">-</p>
 
@@ -72,7 +67,7 @@
                   <span>主页作品批量入队</span>
                 </div>
                 <div class="author-crawl-fields">
-                  <input id="author-crawl-url" type="url" placeholder="https://www.douyin.com/user/..." />
+                  <input id="author-crawl-url" type="url" placeholder="抖音作者主页或 https://space.bilibili.com/116683/upload/video" />
                   <input id="author-crawl-max" type="number" min="1" max="1000" step="1" value="200" title="最多抓取作品数" />
                   <button id="author-crawl-submit" type="button">抓取并加入队列</button>
                 </div>
@@ -133,6 +128,7 @@
             <button class="active" data-library-platform="" type="button">全部平台</button>
             <button data-library-platform="douyin" type="button">抖音</button>
             <button data-library-platform="tiktok" type="button">TikTok</button>
+            <button data-library-platform="bilibili" type="button">哔哩哔哩</button>
           </section>
           <section class="library-overview" id="library-overview"></section>
           <section class="section-head">
@@ -236,9 +232,9 @@
           <section class="sync-create-panel">
             <div>
               <strong>添加作者主页</strong>
-              <span>粘贴抖音作者主页链接，保存为可反复同步的作者源。</span>
+              <span>粘贴抖音作者主页或哔哩哔哩 UP 主投稿页，保存为可反复同步的作者源。</span>
             </div>
-            <input id="sync-source-url" type="url" placeholder="https://www.douyin.com/user/..." />
+            <input id="sync-source-url" type="url" placeholder="https://www.douyin.com/user/... 或 https://space.bilibili.com/116683/upload/video" />
             <input id="sync-source-name" type="text" placeholder="作者名（可选）" />
             <button id="sync-source-add" type="button">添加</button>
           </section>
@@ -303,6 +299,7 @@
               <button class="active" data-task-platform="" type="button">全部下载</button>
               <button data-task-platform="douyin" type="button">抖音</button>
               <button data-task-platform="tiktok" type="button">TikTok</button>
+              <button data-task-platform="bilibili" type="button">哔哩哔哩</button>
             </section>
             <section class="filters">
               <input id="search" type="search" placeholder="搜索任务" />
@@ -373,6 +370,7 @@
               <option value="">全部平台</option>
               <option value="douyin">抖音</option>
               <option value="tiktok">TikTok</option>
+              <option value="bilibili">哔哩哔哩</option>
             </select>
             <select id="logs-status-filter" aria-label="任务状态">
               <option value="">全部状态</option>
@@ -413,6 +411,7 @@
                   <option value="native_douyin">native_douyin（推荐）</option>
                   <option value="native_douyin_share">native_douyin_share</option>
                   <option value="native_tiktok">native_tiktok</option>
+                  <option value="native_bilibili">native_bilibili</option>
                 </select>
               </label>
               <label class="field-row">
@@ -425,6 +424,11 @@
                 <textarea id="setting-tiktok-cookie" rows="4" placeholder="留空表示不修改当前 Cookie"></textarea>
               </label>
               <div class="hint" id="setting-tiktok-cookie-status">-</div>
+              <label class="field-row">
+                <span>哔哩哔哩 Cookie</span>
+                <textarea id="setting-bilibili-cookie" rows="4" placeholder="留空表示不修改当前 Cookie"></textarea>
+              </label>
+              <div class="hint" id="setting-bilibili-cookie-status">-</div>
               <label class="field-row">
                 <span>User-Agent</span>
                 <input id="setting-douyin-user-agent" type="text" />
@@ -538,7 +542,10 @@
         <button id="quality-close" class="secondary" type="button">取消</button>
       </header>
       <div class="quality-body">
-        <img id="quality-cover" class="quality-cover" alt="" hidden />
+        <div id="quality-cover-wrap" class="quality-cover-wrap" data-state="empty">
+          <img id="quality-cover" class="quality-cover" alt="" referrerpolicy="no-referrer" hidden />
+          <span id="quality-cover-placeholder">暂无封面</span>
+        </div>
         <div class="quality-meta">
           <strong id="quality-author">-</strong>
           <span id="quality-video-id">-</span>
@@ -574,6 +581,6 @@
       <button class="reel-nav reel-delete" id="reel-delete" type="button" aria-label="删除当前视频">删除</button>
       <section class="reel-info" id="reel-info"></section>
     </section>
-    <script src="/static/app.js?v=20260605-15"></script>
+    <script src="/static/app.js?v=20260610-auth"></script>
   </body>
 </html>
